@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs and local tooling
+.idea/
+.vscode/
+*.code-workspace
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Local recordings and generated media
+records/*
+!records/.gitkeep
+*.mkv
+*.mp4
+*.svlog
+!tests/fixtures/*.mkv
+!tests/fixtures/*.mp4
+!tests/fixtures/*.svlog
+
+# Build and coverage output
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+

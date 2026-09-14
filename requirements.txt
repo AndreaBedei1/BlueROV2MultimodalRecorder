@@ -1,0 +1,8 @@
+bluerobotics-ping>=0.2.5
+Pillow>=10.0
+av>=10.0
+opencv-python>=4.8
+
+# Test runner used by the offline suite.
+pytest>=7.0
+
