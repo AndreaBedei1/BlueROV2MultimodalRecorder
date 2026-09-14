@@ -28,6 +28,12 @@ A future pose stream should record, when available:
 
 The pose must also be related to the Surveyor mounting transform and any time offset between the vehicle telemetry and sonar acquisition.
 
+## 📍 ROVL contribution and limits
+
+When lock and IMU-derived true angles are available, the ROVL stream supplies a local position relative to the topside transceiver: horizontal range is `cos(elevation) × slant range`, North is `horizontal × cos(compass bearing)`, and East is `horizontal × sin(compass bearing)`. The recorder keeps this in a named local frame and synchronizes it through host monotonic time.
+
+This improves trajectory observability but does not guarantee a perfect 3D reconstruction. Acoustic position accuracy, IMU/magnetic quality, topside motion, mounting transforms, latency, vehicle attitude/depth, Surveyor geometry, and sound-speed assumptions still need independent validation. Apparent angles are receiver-relative and cannot be mixed with world-referenced North/East coordinates.
+
 ## 🔒 No fabricated global reconstruction
 
 The current repository does not emit a global point cloud from guessed vehicle motion. Attitude alone is insufficient for horizontal translation; depth alone is insufficient for full pose. Without a verified position/velocity source, a global reconstruction would conflate sensor geometry with an unsupported trajectory estimate.
@@ -52,4 +58,3 @@ The file should be optional and referenced from `session.json` only when an impl
 6. Export a point cloud with uncertainty and source timestamps.
 
 The existing raw packet and processed JSONL files are retained so this extension can be implemented without discarding previously recorded sessions.
-

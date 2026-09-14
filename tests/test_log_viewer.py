@@ -11,6 +11,9 @@ from bluerov_recorder.log_viewer import (
     PACKET_HEADER,
     cross_track_depth,
     load_raw_intensity,
+    load_rovl_positions,
+    nearest_rovl_sample,
+    rovl_trajectory,
     scan_svlog,
 )
 
@@ -97,6 +100,20 @@ class SonarLogViewerTests(unittest.TestCase):
         log = scan_svlog(path)
         self.assertTrue(log.pings)
         self.assertFalse(log.pings[0].has_raw_intensity)
+
+    def test_rovl_fixture_loads_trajectory_and_nearest_sample(self):
+        fixture = ROOT / "tests" / "fixtures" / "rovl_positions.jsonl"
+        samples = load_rovl_positions(fixture)
+        self.assertEqual(len(samples), 2)
+        nearest = nearest_rovl_sample(samples, 1_800_000_000)
+        self.assertEqual(nearest["line_index"], 1)
+        track = rovl_trajectory(samples)
+        self.assertEqual(track[0], (2.0, 8.0, "NED_HORIZONTAL_UP_VERTICAL"))
+
+    def test_legacy_session_without_rovl_remains_readable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(load_rovl_positions(Path(folder)), [])
+            self.assertIsNone(nearest_rovl_sample([], 123))
 
 
 if __name__ == "__main__":

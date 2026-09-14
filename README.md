@@ -1,6 +1,6 @@
 # BlueROV2 Multimodal Recorder
 
-BlueROV2 Multimodal Recorder is a research-oriented acquisition and visualization tool for synchronized underwater sensing using a BlueROV2 equipped with a Cerulean Surveyor 240-16 multibeam sonar, a Blue Robotics Ping1D single-beam sonar, and an RGB camera.
+BlueROV2 Multimodal Recorder is a research-oriented acquisition and visualization tool for synchronized underwater sensing using a BlueROV2 equipped with a Cerulean Surveyor 240-16 multibeam sonar, a Blue Robotics Ping1D single-beam sonar, an RGB camera, and an optional Cerulean ROV Locator Mk III topside receiver.
 
 The project records raw and processed sensor data locally, provides a live desktop view, and supports offline Surveyor replay. It is intentionally limited to sensing, visualization, recording, and replay.
 
@@ -19,6 +19,7 @@ The recorder combines three independent real-hardware inputs:
 | Cerulean Surveyor 240-16 | TCP `192.168.2.86:62312` | Raw Ping Protocol packets and processed ping records |
 | Blue Robotics Ping1D | UDP `192.168.2.2:9090` through BlueOS PingProxy | Distance, confidence, and full `profile_data` when available |
 | BlueROV2 RGB camera | UDP `5600`, alternatively `5602` | `camera_rgb.mkv` and timestamp metadata |
+| Cerulean ROV Locator Mk III | USB COM, `115200 8N1`, passive read only | Exact NMEA stream, timestamps, decoded positions |
 
 BlueROV2 is operated through BlueOS and an autopilot/flight-controller stack; the recorder does not send vehicle-control commands. The general BlueROV2 platform relationship between BlueOS, the onboard computer, the autopilot, camera, and thrusters is described in the [official BlueROV2 documentation][bluerov2-docs].[^1]
 
@@ -35,6 +36,7 @@ flowchart LR
         rgb_camera[RGB camera]
         surveyor[Surveyor 240-16]
         ping1d[Ping1D]
+        rovl[ROV Locator Mk III]
         blueos[BlueOS and MAVLink]
     end
 
@@ -47,6 +49,7 @@ flowchart LR
     rgb_camera --> recorder
     surveyor --> recorder
     ping1d --> recorder
+    rovl --> recorder
     blueos -. read-only context .-> recorder
     recorder --> live
     recorder --> session
@@ -57,16 +60,17 @@ flowchart LR
     classDef process fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#3b0764
     classDef data fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
 
-    class rgb_camera,surveyor,ping1d,blueos sensor
+    class rgb_camera,surveyor,ping1d,rovl,blueos sensor
     class recorder,live process
     class session,raw_data,processed_data data
 ```
 
 See [the detailed architecture](docs/ARCHITECTURE.md) for the synchronization and raw/processed data boundaries.
 
-### Screenshots
+### Dashboard preview
 
-No hardware screenshot is committed yet. Add future UI captures under `docs/images/` and link them here after removing any sensitive network or vehicle identifiers.
+![Dark four-panel recorder dashboard with synthetic ROVL track](docs/images/demo_rovl_dashboard.png)
+_Figure 1: Hardware-free dashboard preview; red synthetic-data markers make the simulated ROVL source explicit._
 
 ## 🚀 Quick start
 
@@ -100,6 +104,14 @@ The supplied launcher sets this path automatically:
 ```bat
 scripts\start_recorder.bat --offline
 ```
+
+Launch the hardware-free locator demonstration with the same Windows launcher:
+
+```bat
+scripts\start_recorder.bat --demo-rovl
+```
+
+The demo updates at approximately `1 Hz`, shows an obvious synthetic marker, and disables **START SESSION** by default.
 
 ### Start the application
 
@@ -148,7 +160,11 @@ records/real_sessions/<session_id>/
 
 Camera PTS/DTS and time-base values are stored only when supplied by PyAV. Host `monotonic_ns` and `utc_ns` values are recorded separately so samples can be matched without treating container PTS as a wall clock.
 
+When a physical ROVL is connected, the same directory also contains `rovl_raw.nmea`, `rovl_timestamps.csv`, and `rovl_positions.jsonl`. These optional files are not created for sessions without the locator or for the display-only synthetic demo.
+
 The complete field-level contract is in [`docs/DATA_FORMAT.md`](docs/DATA_FORMAT.md).
+
+The passive serial protocol, coordinate-frame rules, and hardware-test checklist are documented in [`docs/ROV_LOCATOR.md`](docs/ROV_LOCATOR.md).
 
 ## 🔄 Offline replay
 
@@ -171,11 +187,17 @@ The standalone read-only log explorer can index and summarize `.svlog` files:
 scripts\start_log_viewer.bat --summary --file records\example.svlog
 ```
 
+Replay a complete recorder session with its optional ROVL trajectory and nearest host-monotonic sample:
+
+```bat
+scripts\start_log_viewer.bat --session records\real_sessions\<session_id>
+```
+
 `--skip-surveyor` omits the live Surveyor worker. If replay and `--skip-surveyor` are both supplied, replay takes precedence so the requested `.svlog` can still be visualized.
 
 ## 🧪 Testing
 
-The test suite is hardware-independent and creates synthetic Ping Protocol packets in temporary directories. It covers packet framing, Surveyor decoding and record construction, `.svlog` replay, Ping1D profile normalization, JSON serialization, timestamp matching, dry-mode safety, GUI construction, and package import without connected hardware.
+The test suite is hardware-independent and creates synthetic Ping Protocol and ROVL sentences in temporary directories. It covers checksums, fragmented serial framing, tolerant `$USRTH` parsing, coordinate conversion, timestamp matching, session files with and without ROVL, demo data, dry-mode safety, GUI construction, and package import without connected hardware or `pyserial`.
 
 ```powershell
 python -m pytest -v
@@ -233,7 +255,7 @@ Large recordings and generated media are ignored by Git. Small synthetic fixture
 
 The long-term objective is to fuse successive Surveyor measurements into a global seabed point cloud while the BlueROV2 moves over or beside the seafloor. Each ping provides geometry in the local sensor frame; a global reconstruction additionally needs a time-aligned vehicle/sensor pose.
 
-This repository does not fabricate global pose or claim a global 3D reconstruction. A future read-only telemetry stream such as `vehicle_telemetry.jsonl` can be added while preserving the current session files. The planned fields are attitude, depth, local position when available, velocity, and timestamps; the source and quality of those fields still require verification on the deployed vehicle.
+This repository does not fabricate global pose or claim a global 3D reconstruction. ROVL adds a time-aligned acoustic position relative to its topside unit, but it does not by itself guarantee a survey-grade or complete six-degree-of-freedom trajectory. A future read-only telemetry stream such as `vehicle_telemetry.jsonl` can be added while preserving the current session files.
 
 See [`docs/RECONSTRUCTION_3D.md`](docs/RECONSTRUCTION_3D.md) for the proposed extension.
 
@@ -245,6 +267,8 @@ See [`docs/RECONSTRUCTION_3D.md`](docs/RECONSTRUCTION_3D.md) for the proposed ex
 - [Surveyor ATOF point-data definition][surveyor-atof]
 - [Surveyor Python getting-started guide][surveyor-python]
 - [Ping Protocol Ping1D messages][ping-protocol]
+- [Cerulean ROVL packet format][rovl-packet]
+- [Cerulean `$USRTH` field definition][rovl-usrth]
 
 License: MIT. See [`LICENSE`](LICENSE).
 
@@ -254,5 +278,7 @@ License: MIT. See [`LICENSE`](LICENSE).
 [surveyor-atof]: https://docs.ceruleansonar.com/c/surveyor-240-16/application-programming-interface/atof_point_data
 [surveyor-python]: https://docs.ceruleansonar.com/c/surveyor-240-16/getting-started-with-ping-python
 [ping-protocol]: https://docs.bluerobotics.com/ping-protocol/pingmessage-ping1d/
+[rovl-packet]: https://docs.ceruleansonar.com/c/rov-locator/communicating-with-the-rovl/packet-format
+[rovl-usrth]: https://docs.ceruleansonar.com/c/rov-locator/communicating-with-the-rovl/messages-from-rovl-to-host/usdusrth-receiver-transmitter-relative-angles-message
 
 [^1]: Blue Robotics. “BlueROV2 Software, Network, and Joystick Setup Instructions.” https://bluerobotics.com/learn/bluerov2-software-setup/

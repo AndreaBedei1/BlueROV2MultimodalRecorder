@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import os
 import queue
+import shutil
 import socket
 import struct
 import threading
@@ -34,6 +36,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageTk
+
+try:
+    from .rovl import DemoROVLWorker, ROVLWorker, list_serial_devices
+except ImportError:  # Support direct execution from the package directory too.
+    from rovl import DemoROVLWorker, ROVLWorker, list_serial_devices
 
 try:
     from .processing import (
@@ -768,7 +775,17 @@ class BlueOSWorker(threading.Thread):
 class SessionRecorder:
     """Write a local synchronized session without changing source files."""
 
-    def __init__(self, root=SESSION_ROOT, camera_port=CAMERA_DEFAULT_PORT, camera_source=None, surveyor_mode="live", surveyor_replay_source=None):
+    def __init__(
+        self,
+        root=SESSION_ROOT,
+        camera_port=CAMERA_DEFAULT_PORT,
+        camera_source=None,
+        surveyor_mode="live",
+        surveyor_replay_source=None,
+        rovl_connected=False,
+        rovl_port=None,
+        rovl_synthetic=False,
+    ):
         self.root = Path(root)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_id = "%s_%s" % (timestamp, uuid.uuid4().hex[:8])
@@ -788,6 +805,8 @@ class SessionRecorder:
         self.camera_stream = None
         self.camera_size = None
         self.camera_frame_index = 0
+        self.rovl_line_index = 0
+        self.rovl_csv = None
         self.camera_backend = "PENDING"
         self.camera_recording_mode = "PENDING"
         self.remux_failed = False
@@ -812,11 +831,21 @@ class SessionRecorder:
             "camera": self.camera_metadata,
             "surveyor": {"host": SURVEYOR_HOST, "port": SURVEYOR_PORT, "mode": self.surveyor_mode, "replay_source": self.surveyor_replay_source, "tx": "LOCKED"},
             "ping1d": {"host": PING1D_HOST, "port": PING1D_PORT},
+            "rovl": {
+                "enabled": False,
+                "connected": bool(rovl_connected),
+                "port": rovl_port,
+                "baud": 115200,
+                "mode": "read-only",
+                "synthetic": bool(rovl_synthetic),
+            },
         }
         self._open_files()
         self.session_metadata["camera"].update({"port": self.camera_port})
         self._write_session(self.session_metadata)
         self._write_svlog_metadata()
+        if rovl_connected and not rovl_synthetic:
+            self.enable_rovl(rovl_port, synthetic=False)
 
     def _open_files(self):
         self.files["surveyor_pings"] = open(str(self.directory / "surveyor_pings.jsonl"), "w", encoding="utf-8")
@@ -887,6 +916,88 @@ class SessionRecorder:
                 item.update({"session_id": self.session_id, "session_start_utc_ns": self.session_start_utc_ns, "session_start_monotonic_ns": self.session_start_monotonic_ns})
                 self.files["ping1d"].write(json.dumps(item, ensure_ascii=False) + "\n")
                 self.files["ping1d"].flush()
+
+    def enable_rovl(self, port, synthetic=False):
+        """Create ROVL artifacts only for an active physical connection."""
+        with self.lock:
+            if self.closed or synthetic:
+                return False
+            metadata = self.session_metadata["rovl"]
+            metadata.update({
+                "enabled": True,
+                "connected": True,
+                "port": port,
+                "baud": 115200,
+                "mode": "read-only",
+                "synthetic": False,
+            })
+            if "rovl_raw" not in self.files:
+                self.files["rovl_raw"] = open(str(self.directory / "rovl_raw.nmea"), "wb")
+                self.files["rovl_timestamps"] = open(
+                    str(self.directory / "rovl_timestamps.csv"), "w", newline="", encoding="utf-8",
+                )
+                self.files["rovl_positions"] = open(
+                    str(self.directory / "rovl_positions.jsonl"), "w", encoding="utf-8",
+                )
+                self.rovl_csv = csv.writer(self.files["rovl_timestamps"])
+                self.rovl_csv.writerow([
+                    "line_index", "host_monotonic_ns", "host_utc_ns",
+                    "session_time_s", "message_type", "checksum_present",
+                    "checksum_ok", "byte_offset", "byte_length",
+                ])
+                self.files["rovl_timestamps"].flush()
+            self._write_session(self.session_metadata)
+            return True
+
+    def mark_rovl_disconnected(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.session_metadata["rovl"]["connected"] = False
+            self._write_session(self.session_metadata)
+
+    def write_rovl_sample(self, sample):
+        """Persist exact serial bytes plus synchronized decoded metadata."""
+        with self.lock:
+            if self.closed or "rovl_raw" not in self.files or sample.get("synthetic"):
+                return False
+            raw = bytes(sample.get("raw_bytes") or b"")
+            raw_stream = self.files["rovl_raw"]
+            byte_offset = raw_stream.tell()
+            raw_stream.write(raw)
+            raw_stream.flush()
+            host_monotonic_ns = int(sample.get("host_monotonic_ns") or time.monotonic_ns())
+            host_utc_ns = int(sample.get("host_utc_ns") or time.time_ns())
+            session_time_s = (host_monotonic_ns - self.session_start_monotonic_ns) / 1_000_000_000.0
+            parsed = dict(sample.get("parsed") or {})
+            message_type = parsed.get("message_type", "UNKNOWN")
+            self.rovl_csv.writerow([
+                self.rovl_line_index, host_monotonic_ns, host_utc_ns,
+                session_time_s, message_type, parsed.get("checksum_present"),
+                parsed.get("checksum_ok"), byte_offset, len(raw),
+            ])
+            self.files["rovl_timestamps"].flush()
+            item = dict(parsed)
+            item.update({
+                "session_id": self.session_id,
+                "session_start_utc_ns": self.session_start_utc_ns,
+                "session_start_monotonic_ns": self.session_start_monotonic_ns,
+                "line_index": self.rovl_line_index,
+                "host_monotonic_ns": host_monotonic_ns,
+                "host_utc_ns": host_utc_ns,
+                "session_time_s": session_time_s,
+                "raw_reference": {
+                    "file": "rovl_raw.nmea",
+                    "byte_offset": byte_offset,
+                    "byte_length": len(raw),
+                },
+                "position": sample.get("position"),
+                "synthetic": False,
+            })
+            self.files["rovl_positions"].write(json.dumps(item, ensure_ascii=False) + "\n")
+            self.files["rovl_positions"].flush()
+            self.rovl_line_index += 1
+            return True
 
     def write_event(self, kind, data=None):
         with self.lock:
@@ -1134,14 +1245,14 @@ def heat_color(value):
     return stops[-1][1]
 
 
-class SonarViewer(tk.Tk):
+class _LegacySonarViewer(tk.Tk):
     """Three-panel live/replay GUI."""
 
     PROFILE_W = 560
     PROFILE_H = 230
 
     def __init__(self, offline=False, replay_path=None, wet_authorized=False, skip_surveyor=False):
-        super(SonarViewer, self).__init__()
+        super(_LegacySonarViewer, self).__init__()
         self.title("BlueROV2 Multimodal Recorder")
         self.geometry("1600x950")
         self.minsize(1200, 760)
@@ -1299,6 +1410,9 @@ class SonarViewer(tk.Tk):
 
     def connect_all(self):
         if self.offline:
+            if getattr(self, "demo_rovl", False) and self.rovl_worker is None:
+                self.rovl_worker = DemoROVLWorker(self.events)
+                self.rovl_worker.start()
             if self.replay_path is not None and self.surveyor_worker is None:
                 self.surveyor_worker = SurveyorWorker(SURVEYOR_HOST, SURVEYOR_PORT, self.events, dry_mode=True, wet_authorized=False, replay_path=self.replay_path)
                 if self.session is not None:
@@ -1307,6 +1421,8 @@ class SonarViewer(tk.Tk):
                 self.status_text.set("Offline replay avviato — nessuna connessione hardware")
             else:
                 self.status_text.set("Offline: nessuna connessione hardware avviata")
+            if self.skip_surveyor:
+                self._set_badge(self.surveyor_badge, False, "SKIPPED")
             return
         if self.blueos_worker is None:
             self.blueos_worker = BlueOSWorker(BLUEOS_HOST, self.events)
@@ -1329,6 +1445,9 @@ class SonarViewer(tk.Tk):
             self.camera_worker = CameraWorker(self.camera_port.get(), source, self.events)
             self._attach_camera_session()
             self.camera_worker.start()
+        if self.rovl_worker is None:
+            self.rovl_worker = ROVLWorker(self.rovl_port.get().strip() or "Auto", self.events)
+            self.rovl_worker.start()
         mode = "REPLAY" if self.replay_path is not None else ("SKIPPED" if self.skip_surveyor else ("TX: LOCKED / DRY MODE" if not self.wet_authorized else "LIVE"))
         self.status_text.set("Connessioni avviate — SURVEYOR %s" % mode)
 
@@ -1351,22 +1470,38 @@ class SonarViewer(tk.Tk):
             self.camera_worker.stop()
         if self.blueos_worker is not None:
             self.blueos_worker.stop_event.set()
+        if getattr(self, "rovl_worker", None) is not None:
+            self.rovl_worker.stop()
         self.status_text.set("Disconnessione richiesta — TX rimane LOCKED")
 
     def start_session(self):
         if self.session is not None:
+            return
+        if getattr(self, "demo_rovl", False):
+            self.status_text.set("Synthetic demo is display-only; recording remains disabled")
             return
         try:
             surveyor_mode = "replay" if self.replay_path is not None else ("skipped" if self.skip_surveyor else "live")
             self.camera_frame_count = 0
             self.surveyor_ping_count = 0
             self.ping1d_sample_count = 0
-            self.session = SessionRecorder(SESSION_ROOT, self.camera_port.get(), self.camera_sdp.get().strip() or None, surveyor_mode, self.replay_path)
+            self.rovl_fix_count = 0
+            rovl_port = getattr(getattr(self, "rovl_worker", None), "port", None) if getattr(self, "rovl_connected", False) else None
+            self.session = SessionRecorder(
+                SESSION_ROOT, self.camera_port.get(), self.camera_sdp.get().strip() or None,
+                surveyor_mode, self.replay_path,
+                rovl_connected=getattr(self, "rovl_connected", False),
+                rovl_port=rovl_port,
+                rovl_synthetic=getattr(self, "rovl_synthetic", False),
+            )
             self._attach_camera_session()
             if self.surveyor_worker is not None:
                 self.surveyor_worker.raw_callback = self.session.write_surveyor_packet
             self.session.update_camera_metadata(self.camera_metadata)
             self.session.write_event("session_started", {"tx": "LOCKED" if not self.wet_authorized else "manual-authorized"})
+            if "record_status" in self.__dict__:
+                self.record_status.set("●  RECORDING")
+                self.record_label.configure(bg="#0d633d", fg="#eafff4")
             self.status_text.set("Registrazione sessione: %s" % self.session.directory)
         except Exception as exc:
             messagebox.showerror("Sessione", "Impossibile avviare la registrazione: %s" % exc)
@@ -1381,13 +1516,16 @@ class SonarViewer(tk.Tk):
         session.write_event("session_stopped")
         session.close()
         self.session = None
+        if "record_status" in self.__dict__:
+            self.record_status.set("●  NOT RECORDING")
+            self.record_label.configure(bg="#402126", fg="#ff777a")
         self.status_text.set("Sessione salvata: %s" % session.directory)
 
     def _poll_events(self):
         try:
             while True:
                 kind, data = self.events.get_nowait()
-                if self.session is not None and kind not in ("camera_frame", "surveyor_raw_packet"):
+                if self.session is not None and kind not in ("camera_frame", "surveyor_raw_packet", "rovl_sample"):
                     try:
                         self.session.write_event(kind, data if kind not in ("surveyor_ping", "ping_sample") else None)
                     except Exception:
@@ -1453,6 +1591,50 @@ class SonarViewer(tk.Tk):
                 elif kind == "ping_closed":
                     self.ping_worker = None
                     self._set_badge(self.ping_badge, False)
+                elif kind == "rovl_connected":
+                    self.rovl_connected = True
+                    self.rovl_synthetic = bool(data.get("synthetic"))
+                    self.rovl_badge["address"].set(str(data.get("port") or "USB COM"))
+                    self._set_badge(self.rovl_badge, True, "SYNTHETIC" if self.rovl_synthetic else "CONNECTED")
+                    if self.session is not None and not self.rovl_synthetic:
+                        self.session.enable_rovl(data.get("port"), synthetic=False)
+                elif kind == "rovl_sample":
+                    self.latest_rovl_sample = data
+                    if self.session is not None and not data.get("synthetic"):
+                        self.session.enable_rovl(getattr(self.rovl_worker, "port", None), synthetic=False)
+                        self.session.write_rovl_sample(data)
+                    parsed = data.get("parsed") or {}
+                    if parsed.get("message_type") == "USRTH":
+                        position = data.get("position") or {}
+                        if position.get("lock"):
+                            self.rovl_fix_count += 1
+                            self.rovl_trail.append(position)
+                            self.rovl_trail = self.rovl_trail[-60:]
+                        self.rovl_sample_times.append(int(data.get("host_monotonic_ns") or time.monotonic_ns()))
+                        self.rovl_sample_times = self.rovl_sample_times[-12:]
+                        self._update_rovl(data)
+                elif kind == "rovl_lock_acquired":
+                    self.rovl_lock = True
+                elif kind == "rovl_lock_lost":
+                    self.rovl_lock = False
+                elif kind == "rovl_unavailable":
+                    self.rovl_worker = None
+                    self.rovl_connected = False
+                    self._set_badge(self.rovl_badge, False, "NOT AVAILABLE")
+                    self.rovl_status.set("NOT AVAILABLE (optional)")
+                elif kind in ("rovl_checksum_error", "rovl_parser_error"):
+                    self.rovl_status.set("RECEIVING · DATA WARNING")
+                elif kind == "rovl_serial_error":
+                    self.rovl_connected = False
+                    self._set_badge(self.rovl_badge, False, "SERIAL ERROR")
+                    self.rovl_status.set("SERIAL ERROR")
+                elif kind == "rovl_disconnected":
+                    self.rovl_worker = None
+                    self.rovl_connected = False
+                    self.rovl_lock = False
+                    self._set_badge(self.rovl_badge, False, "DISCONNECTED")
+                    if self.session is not None:
+                        self.session.mark_rovl_disconnected()
         except queue.Empty:
             pass
         self.after(50, self._poll_events)
@@ -1576,15 +1758,501 @@ class SonarViewer(tk.Tk):
                 worker.join(timeout=timeout)
         self.destroy()
 
+    def destroy(self):
+        """Dispose Tk-owned objects on the UI thread before later GC cycles."""
+        photos = self.__dict__.get("photos")
+        if isinstance(photos, dict):
+            photos.clear()
+        super().destroy()
+
+        def detach(value):
+            if isinstance(value, tk.Variable):
+                value._tk = None
+            elif isinstance(value, dict):
+                for nested in value.values():
+                    detach(nested)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    detach(nested)
+
+        for value in tuple(self.__dict__.values()):
+            detach(value)
+        gc.collect()
+
+
+class SonarViewer(_LegacySonarViewer):
+    """Dark four-panel dashboard with optional passive ROVL tracking."""
+
+    BG = "#06141c"
+    BAR = "#071a24"
+    CARD = "#071922"
+    CARD_ALT = "#091e28"
+    BORDER = "#285368"
+    TEXT = "#e9f2f7"
+    MUTED = "#a9bdd0"
+    CYAN = "#35aef3"
+    GREEN = "#42e59a"
+    AMBER = "#ffbd3a"
+    RED = "#ff6268"
+
+    def __init__(self, offline=False, replay_path=None, wet_authorized=False, skip_surveyor=False, demo_rovl=False, rovl_port="Auto"):
+        self.demo_rovl = bool(demo_rovl)
+        self.initial_rovl_port = rovl_port or "Auto"
+        self.rovl_worker = None
+        self.rovl_connected = False
+        self.rovl_synthetic = False
+        self.rovl_lock = False
+        self.latest_rovl_sample = None
+        self.rovl_trail = []
+        self.rovl_fix_count = 0
+        self.rovl_sample_times = []
+        self._demo_tick = 0
+        super().__init__(offline=offline or self.demo_rovl, replay_path=replay_path, wet_authorized=wet_authorized, skip_surveyor=skip_surveyor)
+        self.title("BlueROV2 Multimodal Recorder")
+        self.geometry("1600x1000")
+        self.rovl_port.set(self.initial_rovl_port)
+        self._refresh_rovl_ports()
+        if self.demo_rovl:
+            self.start_session_button.configure(state="disabled")
+            self.after(80, self._prime_demo_dashboard)
+            self.after(180, self.connect_all)
+
+    def _build_ui(self):
+        self.configure(bg=self.BG)
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Dashboard.TCombobox", fieldbackground="#091c26", background="#112a38", foreground=self.TEXT, arrowcolor=self.TEXT)
+        style.map("Dashboard.TCombobox", fieldbackground=[("readonly", "#091c26")], foreground=[("readonly", self.TEXT)])
+        style.configure("Dashboard.Horizontal.TScale", background=self.CARD, troughcolor="#1a3543")
+
+        self.rovl_port = tk.StringVar(value=self.initial_rovl_port)
+        self.rovl_status = tk.StringVar(value="NOT CONNECTED")
+        self.rovl_connection_text = tk.StringVar(value="COM port       --\nStatus         NOT CONNECTED\nAcoustic lock  ○ NO")
+        self.rovl_position_text = tk.StringVar(value="Slant range        --\nHorizontal range   --\nBearing            --\nElevation          --")
+        self.rovl_attitude_text = tk.StringVar(value="Heading     --\nRoll        --\nPitch       --")
+        self.rovl_health_text = tk.StringVar(value="IMU          --\nGain         --\nIDs          --\nMethod       --\nUpdate age   --\nUpdate rate  --")
+        self.record_status = tk.StringVar(value="●  NOT RECORDING")
+        self.session_bar = tk.StringVar(value="Session:   –")
+        self.counter_bar = tk.StringVar(value="Frames (cam):  0     Surveyor pings:  0     Ping1D samples:  0     ROVL fixes:  0")
+        self.disk_bar = tk.StringVar(value="Disk:  -- GB free")
+        self.clock_bar = tk.StringVar(value="")
+        self.ping_history = []
+
+        titlebar = tk.Frame(self, bg="#081b25", height=38)
+        titlebar.pack(fill="x")
+        titlebar.pack_propagate(False)
+        tk.Label(titlebar, text="◉", bg="#081b25", fg=self.CYAN, font=("Segoe UI", 15, "bold")).pack(side="left", padx=(12, 7))
+        tk.Label(titlebar, text="BlueROV2 Multimodal Recorder", bg="#081b25", fg=self.TEXT, font=("Segoe UI", 12, "bold")).pack(side="left")
+        tk.Label(titlebar, text="v0.1.0", bg="#081b25", fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=12)
+        if self.demo_rovl:
+            tk.Label(titlebar, text="DEMO / SYNTHETIC DATA", bg="#e55358", fg="#160708", font=("Segoe UI", 9, "bold"), padx=10, pady=2).pack(side="right", padx=14)
+
+        connection_bar = tk.Frame(self, bg=self.BAR, padx=10, pady=7)
+        connection_bar.pack(fill="x")
+        badges = tk.Frame(connection_bar, bg=self.BAR)
+        badges.pack(side="left", fill="x", expand=True)
+        self.blueos_badge = self._badge(badges, "BlueOS", BLUEOS_HOST, 0)
+        self.camera_badge = self._badge(badges, "Camera (5600)", "30 FPS", 1)
+        self.surveyor_badge = self._badge(badges, "Surveyor 240-16", SURVEYOR_HOST, 2)
+        self.tx_badge = self._badge(badges, "Surveyor TX", "safe", 3)
+        self.ping_badge = self._badge(badges, "Ping1D", "10.0 Hz", 4)
+        self.rovl_badge = self._badge(badges, "ROVL Mk III", "USB COM", 5)
+        for column in range(6):
+            badges.columnconfigure(column, weight=1)
+        self._set_badge(self.tx_badge, False, "LOCKED (DRY MODE)")
+        if self.replay_path is not None:
+            self._set_badge(self.surveyor_badge, False, "REPLAY")
+        elif self.skip_surveyor:
+            self._set_badge(self.surveyor_badge, False, "SKIPPED")
+
+        controls = tk.Frame(connection_bar, bg=self.BAR, padx=12)
+        controls.pack(side="right")
+        tk.Label(controls, text="ROVL Port", bg=self.BAR, fg=self.MUTED, font=("Segoe UI", 9)).grid(row=0, column=0, padx=(0, 5))
+        self.rovl_combo = ttk.Combobox(controls, textvariable=self.rovl_port, values=("Auto",), width=9, state="readonly", style="Dashboard.TCombobox")
+        self.rovl_combo.grid(row=0, column=1, padx=4)
+        self._button(controls, "Auto", self._select_auto, "#203746", 6).grid(row=0, column=2, padx=4)
+        self._button(controls, "Connect all", self.connect_all, "#176fd1", 11).grid(row=0, column=3, padx=(12, 4))
+        self._button(controls, "Disconnect", self.disconnect_all, "#243847", 10).grid(row=0, column=4, padx=4)
+        self.start_session_button = self._button(controls, "START SESSION", self.start_session, "#078b4c", 13)
+        self.start_session_button.grid(row=0, column=5, padx=(12, 4))
+        self.stop_session_button = self._button(controls, "STOP SESSION", self.stop_session, "#6b2c32", 12)
+        self.stop_session_button.grid(row=0, column=6, padx=4)
+        self.start_surveyor_button = ttk.Button(controls, text="Start Surveyor (LOCKED)", command=self.start_surveyor)
+        if not self.wet_authorized:
+            self.start_surveyor_button.configure(state="disabled")
+
+        body = tk.Frame(self, bg=self.BG, padx=9, pady=4)
+        for column in range(2):
+            body.columnconfigure(column, weight=1, uniform="column")
+        for row in range(2):
+            body.rowconfigure(row, weight=1, uniform="row")
+        camera, surveyor, ping, rovl = (self._card(body) for _ in range(4))
+        camera.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 5))
+        surveyor.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 5))
+        ping.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(5, 0))
+        rovl.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(5, 0))
+        self._build_camera_panel(camera)
+        self._build_surveyor_panel(surveyor)
+        self._build_ping_panel(ping)
+        self._build_rovl_panel(rovl)
+
+        status = tk.Frame(self, bg="#071923", padx=12, pady=7, highlightthickness=1, highlightbackground="#163a4c")
+        status.pack(side="bottom", fill="x", padx=9, pady=(3, 8))
+        self.record_label = tk.Label(status, textvariable=self.record_status, bg="#402126", fg="#ff777a", font=("Segoe UI", 9, "bold"), padx=12, pady=6)
+        self.record_label.pack(side="left")
+        tk.Label(status, textvariable=self.session_bar, bg="#071923", fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=25)
+        tk.Label(status, textvariable=self.counter_bar, bg="#071923", fg="#d6e2ea", font=("Segoe UI", 9)).pack(side="left", padx=8)
+        tk.Label(status, textvariable=self.disk_bar, bg="#071923", fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right", padx=18)
+        tk.Label(status, textvariable=self.clock_bar, bg="#071923", fg="#d6e2ea", font=("Consolas", 9)).pack(side="right")
+        body.pack(fill="both", expand=True)
+
+    def _button(self, parent, text, command, color, width):
+        return tk.Button(parent, text=text, command=command, bg=color, activebackground=color, fg=self.TEXT, activeforeground=self.TEXT, relief="flat", bd=0, padx=8, pady=7, width=width, cursor="hand2", font=("Segoe UI", 9, "bold"))
+
+    def _card(self, parent):
+        return tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+
+    def _panel_header(self, parent, icon, title, stats=""):
+        frame = tk.Frame(parent, bg=self.CARD, padx=11, pady=6)
+        frame.pack(fill="x")
+        tk.Label(frame, text=icon, bg=self.CARD, fg=self.CYAN, font=("Segoe UI Symbol", 14, "bold")).pack(side="left")
+        tk.Label(frame, text=title, bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 13, "bold")).pack(side="left", padx=8)
+        if stats:
+            tk.Label(frame, text=stats, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right")
+        return frame
+
+    def _badge(self, parent, title, address, column):
+        frame = tk.Frame(parent, bg="#081b25", highlightthickness=1, highlightbackground="#21475b", padx=7, pady=5)
+        frame.grid(row=0, column=column, sticky="ew", padx=3)
+        top = tk.Frame(frame, bg="#081b25")
+        top.pack(fill="x")
+        dot = tk.Label(top, text="●", bg="#081b25", fg="#6b7f8a", font=("Segoe UI", 9))
+        dot.pack(side="left")
+        tk.Label(top, text=title, bg="#081b25", fg=self.TEXT, font=("Segoe UI", 8)).pack(side="left", padx=3)
+        state = tk.StringVar(value="DISCONNECTED")
+        label = tk.Label(frame, textvariable=state, bg="#081b25", fg="#6b7f8a", font=("Segoe UI", 8, "bold"))
+        label.pack(pady=(2, 0))
+        address_var = tk.StringVar(value=str(address))
+        tk.Label(frame, textvariable=address_var, bg="#081b25", fg=self.MUTED, font=("Segoe UI", 8)).pack()
+        return {"state": state, "label": label, "dot": dot, "address": address_var}
+
+    def _set_badge(self, badge, online, detail=None):
+        text = str(detail) if detail else ("CONNECTED" if online else "DISCONNECTED")
+        upper = text.upper()
+        color = self.GREEN if online else (self.AMBER if "LOCKED" in upper or "REPLAY" in upper else (self.MUTED if "SKIPPED" in upper or "NOT AVAILABLE" in upper else self.RED))
+        badge["state"].set(text)
+        badge["label"].configure(fg=color)
+        badge["dot"].configure(fg=color)
+
+    def _build_camera_panel(self, parent):
+        self._panel_header(parent, "▣", "RGB CAMERA LIVE", "1920 × 1080     30.1 FPS     H.264 (UDP)")
+        holder = tk.Frame(parent, bg="#041019", padx=9, pady=3)
+        holder.pack(fill="both", expand=True)
+        self.camera_label = tk.Label(holder, text="No RGB frames", bg="#06151e", fg=self.MUTED)
+        self.camera_label.pack(fill="both", expand=True)
+        self.camera_stats = tk.StringVar(value="Awaiting camera stream")
+
+    def _build_surveyor_panel(self, parent):
+        self._panel_header(parent, "◈", "SURVEYOR 240-16", "Range: 25 m     FOV: 80° (±40°)     16 beams")
+        content = tk.Frame(parent, bg=self.CARD, padx=8, pady=3)
+        content.pack(fill="both", expand=True)
+        self.fan_label = tk.Label(content, text="No Surveyor data", bg="#041019", fg=self.MUTED)
+        self.fan_label.pack(side="left", fill="both", expand=True)
+        side = tk.Frame(content, bg=self.CARD_ALT, width=168, padx=9, pady=7, highlightthickness=1, highlightbackground="#224556")
+        side.pack(side="right", fill="y", padx=(8, 0))
+        side.pack_propagate(False)
+        tk.Label(side, text="Display", bg=self.CARD_ALT, fg="#c8d8e4", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        for title, variable in (("Intensity", self.fan_brightness), ("Contrast", self.fan_contrast)):
+            tk.Label(side, text=title, bg=self.CARD_ALT, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
+            ttk.Scale(side, from_=0.2, to=3.0, variable=variable, command=lambda _v: self._rerender_fan(), style="Dashboard.Horizontal.TScale").pack(fill="x")
+        tk.Checkbutton(side, text="Show detections", variable=self.show_atof, command=self._rerender_fan, bg=self.CARD_ALT, fg=self.TEXT, selectcolor="#143649", activebackground=self.CARD_ALT, activeforeground=self.TEXT).pack(anchor="w", pady=(7, 2))
+        self.surveyor_stats = tk.StringVar(value="Ping rate    --\nDetections   --\nStatus       WAITING")
+        tk.Label(side, textvariable=self.surveyor_stats, justify="left", anchor="nw", bg=self.CARD_ALT, fg=self.MUTED, font=("Consolas", 8), pady=8).pack(fill="x")
+        self.attitude_stats = tk.StringVar(value="")
+
+    def _build_ping_panel(self, parent):
+        self._panel_header(parent, "⌁", "PING1D")
+        content = tk.Frame(parent, bg=self.CARD, padx=9, pady=4)
+        content.pack(fill="both", expand=True)
+        plot = tk.Frame(content, bg="#041019")
+        plot.pack(side="left", fill="both", expand=True)
+        tk.Label(plot, text="Distance / Altitude", bg="#041019", fg=self.TEXT, font=("Segoe UI", 10)).pack(anchor="w", padx=48, pady=(3, 0))
+        self.ping_profile_label = tk.Label(plot, text="No Ping1D samples", bg="#041019", fg=self.MUTED)
+        self.ping_profile_label.pack(fill="both", expand=True)
+        side = tk.Frame(content, bg=self.CARD_ALT, width=188, padx=10, pady=7, highlightthickness=1, highlightbackground="#224556")
+        side.pack(side="right", fill="y", padx=(8, 0))
+        side.pack_propagate(False)
+        tk.Label(side, text="Altitude / Range", bg=self.CARD_ALT, fg=self.TEXT, font=("Segoe UI", 10)).pack(anchor="w")
+        self.distance_label = tk.Label(side, text="— m", bg=self.CARD_ALT, fg=self.CYAN, font=("Segoe UI", 27, "bold"))
+        self.distance_label.pack(anchor="w", pady=(3, 7))
+        tk.Label(side, text="Confidence", bg=self.CARD_ALT, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.confidence_label = tk.Label(side, text="—", bg=self.CARD_ALT, fg=self.GREEN, font=("Segoe UI", 10, "bold"))
+        self.confidence_label.pack(anchor="w", pady=(2, 8))
+        self.ping_stats = tk.StringVar(value="Ping rate   --\nGain        --\nMode        Bottom Track\nStatus      WAITING")
+        tk.Label(side, textvariable=self.ping_stats, justify="left", bg=self.CARD_ALT, fg=self.MUTED, font=("Consolas", 8)).pack(anchor="w")
+
+    def _build_rovl_panel(self, parent):
+        header = self._panel_header(parent, "◎", "ROV LOCATOR Mk III")
+        tk.Label(header, text="DEMO / SYNTHETIC DATA" if self.demo_rovl else "READ-ONLY USB", bg="#ff6268" if self.demo_rovl else "#153848", fg="#170708" if self.demo_rovl else self.CYAN, font=("Segoe UI", 9, "bold"), padx=10, pady=2).pack(side="right")
+        content = tk.Frame(parent, bg=self.CARD, padx=8, pady=3)
+        content.pack(fill="both", expand=True)
+        self.rovl_label = tk.Label(content, text="No ROVL position", bg="#041019", fg=self.MUTED)
+        self.rovl_label.pack(side="left", fill="both", expand=True)
+        side = tk.Frame(content, bg=self.CARD_ALT, width=270, padx=9, pady=5, highlightthickness=1, highlightbackground="#224556")
+        side.pack(side="right", fill="y", padx=(8, 0))
+        side.pack_propagate(False)
+        for title, variable in (("Connection", self.rovl_connection_text), ("Position (relative to topside)", self.rovl_position_text), ("Receiver attitude (topside)", self.rovl_attitude_text), ("Status", self.rovl_health_text)):
+            tk.Label(side, text=title, bg=self.CARD_ALT, fg="#b8d2e6", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 1))
+            tk.Label(side, textvariable=variable, bg=self.CARD_ALT, fg="#d7e5ee", justify="left", anchor="nw", font=("Consolas", 8)).pack(fill="x", pady=(0, 3))
+
+    def _select_auto(self):
+        self.rovl_port.set("Auto")
+        self._refresh_rovl_ports()
+
+    def _refresh_rovl_ports(self):
+        current = self.rovl_port.get()
+        values = ["Auto"] + [str(item["device"]) for item in list_serial_devices()]
+        self.rovl_combo.configure(values=values)
+        self.rovl_port.set(current if current in values else "Auto")
+
+    def _prime_demo_dashboard(self):
+        self._set_badge(self.blueos_badge, True, "CONNECTED")
+        self._set_badge(self.camera_badge, True, "DEMO STREAM")
+        self._set_badge(self.surveyor_badge, True, "DEMO NETWORK")
+        self._set_badge(self.ping_badge, True, "DEMO STREAM")
+        self._show_camera_image(self._demo_underwater_image())
+        self.latest_surveyor = self._demo_surveyor_record()
+        self.camera_frame_count, self.surveyor_ping_count, self.ping1d_sample_count = 12420, 5832, 18441
+        self._update_surveyor(self.latest_surveyor)
+        self._animate_demo_streams()
+
+    def _animate_demo_streams(self):
+        if not self.demo_rovl or not self.winfo_exists():
+            return
+        phase = self._demo_tick * 0.11
+        value = 8.4 + 0.65 * math.sin(phase) + 0.22 * math.sin(phase * 2.7)
+        self._update_ping({"distance_m": value, "confidence": 96, "host_monotonic_ns": time.monotonic_ns()}, {"gain": "Auto"})
+        self._demo_tick += 1
+        self.after(400, self._animate_demo_streams)
+
+    def _demo_underwater_image(self):
+        width, height = 920, 450
+        image = Image.new("RGB", (width, height), "#17697e")
+        draw = ImageDraw.Draw(image)
+        for y in range(height):
+            fraction = y / (height - 1)
+            draw.line((0, y, width, y), fill=(int(22 + 20 * fraction), int(112 - 42 * fraction), int(136 - 55 * fraction)))
+        draw.polygon([(0, 320), (170, 295), (350, 335), (530, 307), (720, 329), (920, 285), (920, 450), (0, 450)], fill="#9a9b7c")
+        for index in range(42):
+            x, y = (index * 83) % width, 330 + ((index * 47) % 105)
+            radius = 6 + (index * 7) % 19
+            draw.ellipse((x - radius, y - radius // 2, x + radius, y + radius // 2), fill="#5d675c", outline="#788176")
+        for x, y, radius in ((65, 285, 80), (770, 280, 100), (860, 325, 70)):
+            draw.ellipse((x - radius, y - radius // 2, x + radius, y + radius), fill="#465b52", outline="#627269")
+        return image
+
+    def _demo_surveyor_record(self):
+        matrix = []
+        for row in range(81):
+            angle = -40.0 + row
+            values = []
+            for column in range(120):
+                distance = 25.0 * column / 120.0
+                echo = sum(strength * math.exp(-((angle - target_angle) / 1.5) ** 2 - ((distance - target_range) / 0.45) ** 2) for target_angle, target_range, strength in ((-18, 8.2, 8), (-4, 14.8, 11), (14, 9.2, 9), (27, 7.0, 8)))
+                bottom = 4.5 * math.exp(-((distance - (5.1 + 0.002 * angle * angle)) / 0.7) ** 2)
+                values.append(max(0.01, 0.8 + 0.12 * math.sin(angle * 0.23) + 0.25 * math.sin(distance * 0.8) + echo + bottom))
+            matrix.append(values)
+        return {"matrix": matrix, "range_start_m": 0.0, "range_end_m": 25.0, "ping_number": 5832, "ping_rate_hz": 4.8, "detection_count": 12, "points": [{"angle_rad": math.radians(a), "distance_m": d} for a, d in ((-28, 8.3), (-18, 7.2), (-9, 14.8), (3, 9.0), (14, 8.3), (26, 7.0))], "channel_data_status": "AVAILABLE", "host_monotonic_ns": time.monotonic_ns()}
+
+    def _show_camera_image(self, image):
+        self.latest_camera_pil = image.copy()
+        shown = image.copy()
+        shown.thumbnail((730, 365), Image.Resampling.LANCZOS)
+        self.photos["camera"] = ImageTk.PhotoImage(shown)
+        self.camera_label.configure(image=self.photos["camera"], text="")
+
+    def _update_camera(self, frame):
+        if cv2 is not None:
+            try:
+                self._show_camera_image(Image.fromarray(frame[:, :, ::-1]))
+                self.camera_frame_count += 1
+            except Exception:
+                pass
+
+    def _update_surveyor(self, record):
+        self._rerender_fan()
+        self.surveyor_stats.set("Ping rate    %4.1f Hz\nDetections   %4d\nStatus       RECEIVING" % (record.get("ping_rate_hz", 0.0), record.get("detection_count", 0)))
+
+    def _rerender_fan(self):
+        if self.latest_surveyor is None:
+            return
+        record = dict(self.latest_surveyor)
+        if record.get("channel_signals"):
+            try:
+                record["matrix"] = beamform_surveyor_channels(record["channel_signals"], record.get("range_start_m", 0.0), record.get("range_end_m", 10.0), record.get("sos_mps", 1500.0), threshold_percent=self.fan_threshold.get())
+            except ValueError:
+                pass
+        image = fan_image(record, 620, 365, self.fan_brightness.get(), self.fan_contrast.get(), self.show_atof.get())
+        self.photos["fan"] = ImageTk.PhotoImage(image)
+        self.fan_label.configure(image=self.photos["fan"], text="")
+
+    def _update_ping(self, distance, profile):
+        value = float(distance.get("distance_m", 0.0))
+        confidence = int(distance.get("confidence", 0))
+        self.ping_history.append((int(distance.get("host_monotonic_ns") or time.monotonic_ns()), value))
+        self.ping_history = self.ping_history[-150:]
+        self.distance_label.configure(text="%.1f m" % value)
+        self.confidence_label.configure(text="●  %d%% · VALID" % confidence)
+        self.ping_stats.set("Ping rate   10.0 Hz\nGain        %s\nMode        Bottom Track\nStatus      RECEIVING" % ((profile or {}).get("gain", "Auto")))
+        self._draw_ping_history()
+
+    def _draw_ping_history(self):
+        width, height = 570, 285
+        image = Image.new("RGB", (width, height), "#041019")
+        draw = ImageDraw.Draw(image)
+        left, top, right, bottom = 48, 15, width - 15, height - 34
+        for value in range(0, 21, 5):
+            y = bottom - value / 20.0 * (bottom - top)
+            draw.line((left, y, right, y), fill="#264452")
+            draw.text((14, y - 6), str(value), fill="#9db2c1")
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            x = left + fraction * (right - left)
+            draw.line((x, top, x, bottom), fill="#1c3948")
+            draw.text((x - 10, bottom + 8), "%d" % int(-60 + fraction * 60), fill="#9db2c1")
+        samples = self.ping_history[-60:]
+        points = [(left + index / max(1, len(samples) - 1) * (right - left), bottom - max(0.0, min(20.0, item[1])) / 20.0 * (bottom - top)) for index, item in enumerate(samples)]
+        if len(points) > 1:
+            draw.line(points, fill=self.CYAN, width=2)
+        draw.text((width // 2 - 20, height - 16), "Time (s)", fill="#9db2c1")
+        draw.text((3, 3), "Distance (m)", fill="#cbdbe5")
+        self.photos["ping"] = ImageTk.PhotoImage(image)
+        self.ping_profile_label.configure(image=self.photos["ping"], text="")
+
+    def _update_rovl(self, sample):
+        parsed, position = sample.get("parsed") or {}, sample.get("position") or {}
+        self.rovl_lock = bool(position.get("lock"))
+        port = getattr(self.rovl_worker, "port", None) or ("DEMO" if sample.get("synthetic") else "--")
+        status = "RECEIVING" if parsed.get("parse_ok") else "DATA WARNING"
+        self.rovl_connection_text.set("COM port       %s\nStatus         %s\nAcoustic lock  %s" % (port, status, "● YES" if self.rovl_lock else "○ NO"))
+        if self.rovl_lock:
+            self.rovl_position_text.set("Slant range       %4.1f m\nHorizontal range  %4.1f m\nBearing          %5.1f°\nElevation        %5.1f°" % (position.get("slant_range_m") or 0.0, position.get("horizontal_range_m") or 0.0, position.get("bearing_deg") or 0.0, position.get("elevation_deg") or 0.0))
+        else:
+            self.rovl_position_text.set("Slant range        --\nHorizontal range   --\nBearing            --\nElevation          --")
+        self.rovl_attitude_text.set("Heading     %s\nRoll        %s\nPitch       %s" % ("%.1f°" % parsed["ch"] if parsed.get("ch") is not None else "--", "%.1f°" % parsed["er"] if parsed.get("er") is not None else "--", "%.1f°" % parsed["ep"] if parsed.get("ep") is not None else "--"))
+        if len(self.rovl_sample_times) > 1:
+            span = (self.rovl_sample_times[-1] - self.rovl_sample_times[0]) / 1e9
+            rate = (len(self.rovl_sample_times) - 1) / span if span > 0 else 0.0
+        else:
+            rate = 0.0
+        self.rovl_health_text.set(
+            "IMU          %s\nGain         %s\nIDs          %s / %s\nMethod       %s\nUpdate age   0.0 s\nUpdate rate  %.1f Hz" % (
+                parsed.get("im") or "--",
+                "%.0f dB" % parsed["db"] if parsed.get("db") is not None else "--",
+                parsed.get("idx") if parsed.get("idx") is not None else "--",
+                parsed.get("idq") if parsed.get("idq") is not None else "--",
+                position.get("method") or "--",
+                rate,
+            )
+        )
+        self._draw_rovl_position(position)
+
+    def _draw_rovl_position(self, position):
+        width, height = 500, 315
+        image = Image.new("RGB", (width, height), "#041019")
+        draw = ImageDraw.Draw(image)
+        cx, cy, radial = width * 0.50, height * 0.52, 132.0
+        ranges = [float(item.get("horizontal_range_m")) for item in self.rovl_trail if item.get("horizontal_range_m") is not None]
+        scale = max(30.0, math.ceil(max(ranges or [0.0]) / 10.0) * 10.0)
+        draw.text((12, 8), "⌄  Top-Down View (%s)" % ("North / East" if position.get("north_m") is not None else "Receiver-relative"), fill="#c8d9e5")
+        for fraction in (1 / 3, 2 / 3, 1.0):
+            radius = radial * fraction
+            draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline="#295066")
+            draw.text((cx + 4, cy - radius - 10), "%.0f m" % (scale * fraction), fill="#a9bdca")
+        draw.line((cx - radial, cy, cx + radial, cy), fill="#294d60")
+        draw.line((cx, cy - radial, cx, cy + radial), fill="#294d60")
+        if position.get("north_m") is not None:
+            draw.text((cx - 5, cy - radial - 28), "N", fill=self.TEXT)
+        def project(item):
+            if item.get("north_m") is not None:
+                east, north = float(item["east_m"]), float(item["north_m"])
+            else:
+                east, north = -float(item.get("relative_y_m") or 0.0), float(item.get("relative_x_m") or 0.0)
+            return cx + east / scale * radial, cy - north / scale * radial
+        points = [project(item) for item in self.rovl_trail if item.get("lock")]
+        if len(points) > 1:
+            draw.line(points, fill="#1f91d5", width=2)
+        for point in points[:-1]:
+            draw.ellipse((point[0] - 2, point[1] - 2, point[0] + 2, point[1] + 2), fill="#2ea8ed")
+        draw.ellipse((cx - 7, cy - 7, cx + 7, cy + 7), fill="#ff5f60")
+        draw.text((cx - 28, cy + 12), "Topside", fill=self.TEXT)
+        if position.get("lock"):
+            x, y = project(position)
+            draw.polygon(((x, y - 9), (x - 8, y + 8), (x + 8, y + 8)), fill=self.CYAN)
+            draw.line((cx, cy, x, y), fill="#2e9dd9")
+            draw.text((x + 12, y - 18), "BlueROV2\n(%.1f m)" % float(position.get("slant_range_m") or 0.0), fill=self.CYAN)
+        draw.text((width - 85, height - 18), "Scale: %.0f m" % scale, fill="#a9bdca")
+        self.photos["rovl"] = ImageTk.PhotoImage(image)
+        self.rovl_label.configure(image=self.photos["rovl"], text="")
+
+    def _refresh_status_age(self):
+        try:
+            target = SESSION_ROOT.parent if SESSION_ROOT.parent.exists() else APP_ROOT
+            free_gb = shutil.disk_usage(str(target)).free / (1024 ** 3)
+            self.disk_bar.set("Disk:  %.0f GB free" % free_gb)
+        except Exception:
+            self.disk_bar.set("Disk:  -- GB free")
+        self.clock_bar.set(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+        if self.session is None:
+            self.session_bar.set("Session:   –")
+        else:
+            elapsed = (time.monotonic_ns() - self.session.session_start_monotonic_ns) / 1_000_000_000.0
+            self.session_bar.set("Session:   %s   %.1fs" % (self.session.session_id, elapsed))
+        self.counter_bar.set(
+            "Frames (cam):  %s     Surveyor pings:  %s     Ping1D samples:  %s     ROVL fixes:  %s" %
+            (f"{self.camera_frame_count:,}", f"{self.surveyor_ping_count:,}", f"{self.ping1d_sample_count:,}", f"{self.rovl_fix_count:,}")
+        )
+        if self.latest_rovl_sample is not None:
+            parsed = self.latest_rovl_sample.get("parsed") or {}
+            age = max(0.0, (time.monotonic_ns() - int(self.latest_rovl_sample.get("host_monotonic_ns") or time.monotonic_ns())) / 1_000_000_000.0)
+            lines = self.rovl_health_text.get().splitlines()
+            if len(lines) >= 2:
+                lines[-2] = "Update age   %.1f s" % age
+                self.rovl_health_text.set("\n".join(lines))
+        self.after(250, self._refresh_status_age)
+
+    def close(self):
+        self.stop_session()
+        self.disconnect_all()
+        for worker, timeout in (
+            (self.surveyor_worker, 1.5), (self.ping_worker, 1.0),
+            (self.camera_worker, 1.0), (self.blueos_worker, 0.5),
+            (self.rovl_worker, 1.0),
+        ):
+            if worker is not None:
+                worker.join(timeout=timeout)
+        self.destroy()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="BlueROV2 Multimodal Recorder — Surveyor/Ping1D/RGB")
+    parser = argparse.ArgumentParser(description="BlueROV2 Multimodal Recorder — Surveyor/Ping1D/RGB/ROVL")
     parser.add_argument("--offline", action="store_true", help="build the GUI without connecting to hardware")
     parser.add_argument("--replay-surveyor", metavar="FILE.svlog", help="replay a local Surveyor log without transmitting")
     parser.add_argument("--skip-surveyor", action="store_true", help="do not instantiate or connect the hardware Surveyor")
     parser.add_argument("--wet-authorized", action="store_true", help="manual future authorization for Surveyor ping transmission")
+    parser.add_argument("--rovl-port", default="Auto", help="ROVL COM port or Auto (default)")
+    parser.add_argument("--demo-rovl", action="store_true", help="show obvious synthetic ROVL data without hardware or recording")
     args = parser.parse_args()
-    app = SonarViewer(offline=args.offline, replay_path=args.replay_surveyor, wet_authorized=args.wet_authorized, skip_surveyor=args.skip_surveyor)
+    app = SonarViewer(
+        offline=args.offline,
+        replay_path=args.replay_surveyor,
+        wet_authorized=args.wet_authorized,
+        skip_surveyor=args.skip_surveyor,
+        demo_rovl=args.demo_rovl,
+        rovl_port=args.rovl_port,
+    )
     app.mainloop()
 
 

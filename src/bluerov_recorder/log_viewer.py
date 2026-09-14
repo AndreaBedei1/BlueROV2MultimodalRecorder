@@ -64,6 +64,57 @@ DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "records" / "sonar"
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 
+def load_rovl_positions(session_path: Path) -> List[Dict[str, object]]:
+    """Load optional ROVL JSONL records; older sessions return an empty list."""
+    root = Path(session_path)
+    path = root if root.name == "rovl_positions.jsonl" else root / "rovl_positions.jsonl"
+    if not path.exists():
+        return []
+    samples: List[Dict[str, object]] = []
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item["source_line"] = line_number
+            samples.append(item)
+    samples.sort(key=lambda item: int(item.get("host_monotonic_ns") or 0))
+    return samples
+
+
+def nearest_rovl_sample(samples: List[Dict[str, object]], target_monotonic_ns: int) -> Optional[Dict[str, object]]:
+    """Return the ROVL record nearest to another stream's host timestamp."""
+    if not samples:
+        return None
+    target = int(target_monotonic_ns)
+    lo, hi = 0, len(samples)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if int(samples[mid].get("host_monotonic_ns") or 0) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    candidates = samples[max(0, lo - 1):min(len(samples), lo + 1)]
+    return min(candidates, key=lambda item: abs(int(item.get("host_monotonic_ns") or 0) - target))
+
+
+def rovl_trajectory(samples: List[Dict[str, object]]) -> List[Tuple[float, float, str]]:
+    """Extract plottable x/y points while keeping coordinate frames separate."""
+    points: List[Tuple[float, float, str]] = []
+    for sample in samples:
+        position = sample.get("position") or {}
+        if not isinstance(position, dict) or not position.get("lock"):
+            continue
+        if position.get("north_m") is not None and position.get("east_m") is not None:
+            points.append((float(position["east_m"]), float(position["north_m"]), "NED_HORIZONTAL_UP_VERTICAL"))
+        elif position.get("relative_x_m") is not None and position.get("relative_y_m") is not None:
+            points.append((-float(position["relative_y_m"]), float(position["relative_x_m"]), "RECEIVER_RELATIVE_MATH"))
+    return points
+
+
 @dataclass
 class PingRecord:
     """Compact representation of one imaging-sonar ping."""
@@ -872,6 +923,94 @@ class SonarLogViewer(tk.Tk):
         canvas.create_image(0, 0, image=photo, anchor="nw")
 
 
+class ROVLSessionViewer(tk.Tk):
+    """Timeline-oriented viewer for the optional ROVL session stream."""
+
+    def __init__(self, session_path: Path):
+        super().__init__()
+        self.session_path = Path(session_path)
+        self.samples = load_rovl_positions(self.session_path)
+        self.image_ref = None
+        self.title("BlueROV2 Session Log · ROV Locator")
+        self.geometry("1120x720")
+        self.configure(bg="#06141c")
+        self.timeline = tk.DoubleVar(value=0.0)
+        self.detail = tk.StringVar(value="ROVL data not present in this session")
+        self.summary = tk.StringVar(value=self.session_path.name)
+        self._build_ui()
+        self._render()
+
+    def _build_ui(self) -> None:
+        top = tk.Frame(self, bg="#081b25", padx=14, pady=10)
+        top.pack(fill="x")
+        tk.Label(top, text="ROV LOCATOR Mk III · SESSION REPLAY", bg="#081b25", fg="#edf5fa", font=("Segoe UI", 14, "bold")).pack(side="left")
+        tk.Label(top, textvariable=self.summary, bg="#081b25", fg="#a9bdd0", font=("Segoe UI", 9)).pack(side="right")
+        body = tk.Frame(self, bg="#06141c", padx=10, pady=10)
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Label(body, bg="#041019", fg="#a9bdd0")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        side = tk.Frame(body, bg="#091e28", width=310, padx=12, pady=12, highlightthickness=1, highlightbackground="#285368")
+        side.pack(side="right", fill="y", padx=(10, 0))
+        side.pack_propagate(False)
+        tk.Label(side, text="Nearest synchronized sample", bg="#091e28", fg="#c8d9e5", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(side, textvariable=self.detail, bg="#091e28", fg="#dce8ef", justify="left", anchor="nw", font=("Consolas", 9)).pack(fill="x", pady=(10, 0))
+        first = int(self.samples[0].get("host_monotonic_ns") or 0) if self.samples else 0
+        last = int(self.samples[-1].get("host_monotonic_ns") or first) if self.samples else first
+        self.first_monotonic_ns = first
+        duration = max(0.0, (last - first) / 1_000_000_000.0)
+        bottom = tk.Frame(self, bg="#071923", padx=16, pady=10)
+        bottom.pack(fill="x")
+        tk.Label(bottom, text="Session timeline", bg="#071923", fg="#a9bdd0").pack(side="left")
+        self.scale = tk.Scale(bottom, from_=0.0, to=max(0.1, duration), resolution=0.1, orient="horizontal", variable=self.timeline, command=lambda _value: self._render(), bg="#071923", fg="#dce8ef", troughcolor="#1c4154", highlightthickness=0, length=780)
+        self.scale.pack(side="left", fill="x", expand=True, padx=12)
+
+    def _render(self) -> None:
+        sample = nearest_rovl_sample(self.samples, self.first_monotonic_ns + int(self.timeline.get() * 1_000_000_000))
+        width, height = 760, 590
+        image = Image.new("RGB", (width, height), "#041019")
+        draw = ImageDraw.Draw(image)
+        cx, cy, radius = width / 2, height / 2, 245
+        trajectory = rovl_trajectory(self.samples)
+        scale = max(10.0, math.ceil(max([math.hypot(x, y) for x, y, _frame in trajectory] or [0.0]) / 10.0) * 10.0)
+        for fraction in (0.25, 0.5, 0.75, 1.0):
+            ring = radius * fraction
+            draw.ellipse((cx - ring, cy - ring, cx + ring, cy + ring), outline="#285368")
+            draw.text((cx + 4, cy - ring - 12), "%.0f m" % (scale * fraction), fill="#9fb7c6")
+        draw.line((cx - radius, cy, cx + radius, cy), fill="#285368")
+        draw.line((cx, cy - radius, cx, cy + radius), fill="#285368")
+        if trajectory:
+            frames = {point[2] for point in trajectory}
+            if len(frames) == 1:
+                screen = [(cx + x / scale * radius, cy - y / scale * radius) for x, y, _frame in trajectory]
+                if len(screen) > 1:
+                    draw.line(screen, fill="#299ee5", width=3)
+                for point in screen[::max(1, len(screen) // 40)]:
+                    draw.ellipse((point[0] - 2, point[1] - 2, point[0] + 2, point[1] + 2), fill="#55c0ff")
+            else:
+                draw.text((18, 42), "Track contains multiple frames; segments are not combined.", fill="#ffbd3a")
+        draw.ellipse((cx - 8, cy - 8, cx + 8, cy + 8), fill="#ff6268")
+        draw.text((18, 16), "Top-down ROVL trajectory", fill="#dce8ef")
+        if sample is None:
+            draw.text((width / 2 - 120, height / 2 - 10), "No ROVL stream in this session", fill="#ffbd3a")
+            self.detail.set("ROVL data not present\nLegacy session remains readable")
+        else:
+            position = sample.get("position") or {}
+            raw_ref = sample.get("raw_reference") or {}
+            self.detail.set(
+                "Line             %s\nSession time     %.3f s\nMessage          %s\nChecksum         %s\nLock             %s\nFrame            %s\nSlant range      %s\nBearing          %s\nElevation        %s\nRaw offset       %s + %s bytes" % (
+                    sample.get("line_index", "--"), float(sample.get("session_time_s") or 0.0),
+                    sample.get("message_type", "--"), sample.get("checksum_ok"),
+                    position.get("lock", False), position.get("coordinate_frame") or "--",
+                    "%.2f m" % position["slant_range_m"] if position.get("slant_range_m") is not None else "--",
+                    "%.1f°" % position["bearing_deg"] if position.get("bearing_deg") is not None else "--",
+                    "%.1f°" % position["elevation_deg"] if position.get("elevation_deg") is not None else "--",
+                    raw_ref.get("byte_offset", "--"), raw_ref.get("byte_length", "--"),
+                )
+            )
+        self.image_ref = ImageTk.PhotoImage(image)
+        self.canvas.configure(image=self.image_ref, text="")
+
+
 def print_summary(paths: List[Path]) -> None:
     for path in paths:
         log = scan_svlog(path)
@@ -888,7 +1027,12 @@ def main() -> int:
     parser.add_argument("--folder", type=Path, default=None, help="cartella da indicizzare")
     parser.add_argument("--file", type=Path, action="append", default=[], help="file .svlog da aprire; ripetibile")
     parser.add_argument("--summary", action="store_true", help="stampa un riepilogo e non apre la GUI")
+    parser.add_argument("--session", type=Path, default=None, help="open a recorder session with optional ROVL trajectory")
     args = parser.parse_args()
+    if args.session is not None:
+        app = ROVLSessionViewer(args.session)
+        app.mainloop()
+        return 0
     if args.file:
         paths = [p for p in args.file if p.exists()]
     else:

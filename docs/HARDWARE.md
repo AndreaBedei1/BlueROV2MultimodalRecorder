@@ -83,6 +83,14 @@ The RGB camera is the BlueROV2 video stream used for live context and synchroniz
 
 When PyAV can open the source, one ingest loop demuxes encoded packets for MKV remux and decodes frames for the GUI. OpenCV is used only as the fallback path. The camera module does not change BlueOS stream configuration.
 
+## 🔌 ROV Locator Mk III
+
+The optional Cerulean ROV Locator Mk III topside transceiver normally appears on Windows as a USB COM port. Cerulean specifies `115200` baud, eight data bits, no parity, and one stop bit for receiver/transceiver USB communication.[^5] Its output uses ASCII packets compatible with NMEA-0183 sentences, including `$USRTH`, `$USINF`, `$USERR`, `$USDEB`, and forwarded GNSS sentences.[^6]
+
+The application can select a COM port manually or use **Auto**. Auto mode briefly listens to enumerated ports and accepts a device only after observing a Cerulean `US` message. It does not infer or hard-code vendor/product IDs. Probing and acquisition are strictly read-only: the code sends no configuration, calibration, reset, baud-rate, acoustic, or passthrough command.
+
+ROVL absence is non-fatal. **Connect all** continues to start the other inputs even when no compatible COM stream is found. Disconnect closes the serial handle.
+
 ## 🔐 Safety boundary
 
 The recorder is an acquisition tool, not a vehicle controller. It does not arm, move, steer, or configure the ROV. Keep the Surveyor in the default locked mode unless an appropriately approved in-water procedure explicitly authorizes transmission.
@@ -93,4 +101,5 @@ The recorder is an acquisition tool, not a vehicle controller. It does not arm, 
 [^2]: Cerulean Sonar. “Surveyor 240-16 MBES.” https://ceruleansonar.com/product/surveyor-240-16/
 [^3]: Cerulean Sonar. “Getting Started With Ping-Python.” https://docs.ceruleansonar.com/c/surveyor-240-16/getting-started-with-ping-python
 [^4]: Blue Robotics. “Ping1D messages.” https://docs.bluerobotics.com/ping-protocol/pingmessage-ping1d/
-
+[^5]: Cerulean Sonar. (2025). “Serial Parameters.” https://docs.ceruleansonar.com/c/rov-locator/communicating-with-the-rovl/serial-parameters
+[^6]: Cerulean Sonar. (2025). “Packet Format.” https://docs.ceruleansonar.com/c/rov-locator/communicating-with-the-rovl/packet-format

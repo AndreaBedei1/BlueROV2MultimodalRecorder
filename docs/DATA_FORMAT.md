@@ -30,6 +30,7 @@ records/real_sessions/<session_id>/
 | `camera` | Camera source, backend, timing, dimensions, and remux metadata |
 | `surveyor` | Surveyor host/port, mode, replay source, and TX state |
 | `ping1d` | Ping1D host and port |
+| `rovl` | Optional connection, COM port, `115200` baud, read-only mode, and synthetic flag |
 
 The `camera` object includes `port`, `source`, `backend`, `recording_mode`, `input_status`, `remux_status`, `codec`, `width`, `height`, `nominal_fps`, `video_pts`, and `time_base` with `num`/`den`. `recording_reason` may be present when the fallback path explains a failure.
 
@@ -149,7 +150,28 @@ Each line contains the two records emitted by the Ping1D worker plus session ide
 
 `profile` is `null` when only a distance response is available. The normalized `profile` list preserves the complete response-strength vector returned by the official Ping1D profile message; `display_row` is a GUI normalization and is not a second sensor measurement.
 
+## 📍 Optional ROVL files
+
+The following files exist only when a physical ROVL stream is connected during the session. The display-only `--demo-rovl` path does not create them.
+
+### `rovl_raw.nmea`
+
+This binary file stores each received serial frame exactly as read, including its original line ending. Invalid checksums and unknown future sentence types remain in the raw stream.
+
+### `rovl_timestamps.csv`
+
+```text
+line_index,host_monotonic_ns,host_utc_ns,session_time_s,message_type,checksum_present,checksum_ok,byte_offset,byte_length
+```
+
+`byte_offset` and `byte_length` point into `rovl_raw.nmea`. `checksum_ok` is empty when no checksum was present, `true` for a verified checksum, and `false` for a mismatch or malformed suffix.
+
+### `rovl_positions.jsonl`
+
+Each line contains the decoded sentence, all known `$USRTH` fields, `extra_fields`, checksum result, host timestamps, optional GNSS/device time, raw-file reference, and derived `position`. Missing numeric values are JSON `null`, never fabricated zeros.
+
+The known `$USRTH` order is `ab,ac,ae,sr,tb,cb,te,er,ep,ey,ch,db,ah,ag,ls,im,oc,idx,idq`. Extra trailing fields are preserved. A true Compass solution uses `cb` and `te`, with `north = horizontal × cos(cb)` and `east = horizontal × sin(cb)`. An apparent `ab`/`ae` fallback is labeled `RECEIVER_RELATIVE_MATH`; it is never relabeled as North/East.
+
 ## 🔗 Timestamp rules
 
-Host monotonic time is the matching clock. Host UTC time provides external correlation. Device timestamps, camera PTS/DTS, and media time bases are retained as separate fields and are not silently converted into one another.
-
+Host monotonic time is the matching clock. Host UTC time provides external correlation. ROVL GNSS/device timestamps, camera PTS/DTS, and media time bases are retained as separate fields and are not silently converted into one another.
