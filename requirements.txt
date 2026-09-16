@@ -1,8 +1,10 @@
 bluerobotics-ping>=0.2.5
 pyserial>=3.5
 Pillow>=10.0
+numpy>=1.24
 av>=10.0
 opencv-python>=4.8
+psutil>=5.9
 
 # Test runner used by the offline suite.
 pytest>=7.0

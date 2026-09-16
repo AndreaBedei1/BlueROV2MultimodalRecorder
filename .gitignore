@@ -23,6 +23,7 @@ Desktop.ini
 # Local recordings and generated media
 records/*
 !records/.gitkeep
+logs/
 *.mkv
 *.mp4
 *.svlog
@@ -37,3 +38,5 @@ dist/
 .coverage
 htmlcov/
 
+Sonar15-09/
+Video15-09/

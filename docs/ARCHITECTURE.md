@@ -1,4 +1,25 @@
-# Architecture
+# Architecture (current live recorder)
+
+> The desktop live path owns only RGB camera, Ping1D and read-only ROVL. The
+> Surveyor 240-16 is external: BlueOS/SonarView captures its `.svlog` onboard.
+> The legacy Surveyor sections below describe offline compatibility only.
+
+```mermaid
+flowchart LR
+  cam[RGB RTP/H264] --> workers[bounded acquisition workers]
+  ping[Ping1D PingProxy] --> workers
+  rovl[ROVL USB COM read-only] --> workers
+  workers --> mailboxes[capacity-1 preview mailboxes] --> gui[responsive GUI]
+  workers --> writers[independent buffered writers] --> session[synchronized session]
+  surveyor[Surveyor] --> sonarview[BlueOS / SonarView] --> svlog[external .svlog]
+```
+
+The GUI never performs I/O or heavy processing. Camera uses single ingest with
+encoded remux plus latest-only preview; Ping1D preserves full profiles; ROVL
+preserves exact NMEA bytes and decoded positions. Records carry host monotonic
+and UTC nanoseconds, while camera PTS/DTS and device clocks remain separate.
+Writers batch/flush and fsync on close. Bounded queues and diagnostics expose
+rates, drops, queue health, CPU/RSS and GUI heartbeat.
 
 _Runtime architecture for live visualization, synchronized recording, and offline replay._
 

@@ -1,4 +1,10 @@
-# Data format
+# Data format (current live sessions)
+
+New desktop sessions contain Camera, Ping1D and optional physical ROVL files
+only. `session.json` records `surveyor_recording: "external / BlueOS SonarView"`;
+the desktop app does not create `surveyor_raw.svlog` or `surveyor_pings.jsonl`.
+The legacy Surveyor sections below are retained solely for reading old
+sessions and offline analysis.
 
 _Field-level description of files written by `SessionRecorder`._
 

@@ -156,11 +156,6 @@ class SonarViewerOfflineTests(unittest.TestCase):
                 "host_utc_ns": session.session_start_utc_ns + 2_500_000_000,
                 "key_frame": True, "packet_size": 123,
             })
-            csv_text = (session.directory / "camera_timestamps.csv").read_text()
-            self.assertIn("pts_seconds", csv_text.splitlines()[0])
-            self.assertIn(",100,90,1,1000,0.1,0.09,", csv_text)
-            self.assertIn(",2.5,True,123", csv_text)
-
             session._write_camera_timestamp({
                 "frame_index": 3, "packet_index": None, "pts": None, "dts": None,
                 "time_base_num": None, "time_base_den": None,
@@ -169,6 +164,11 @@ class SonarViewerOfflineTests(unittest.TestCase):
                 "host_utc_ns": session.session_start_utc_ns + 3_000_000_000,
                 "key_frame": None, "packet_size": None,
             })
+            session.close()
+            csv_text = (session.directory / "camera_timestamps.csv").read_text()
+            self.assertIn("pts_seconds", csv_text.splitlines()[0])
+            self.assertIn(",100,90,1,1000,0.1,0.09,", csv_text)
+            self.assertIn(",2.5,True,123", csv_text)
             # PTS/DTS remain empty when unavailable, while host session time is
             # still a real synchronization clock.
             with (session.directory / "camera_timestamps.csv").open(newline="") as stream:
@@ -176,13 +176,16 @@ class SonarViewerOfflineTests(unittest.TestCase):
             self.assertEqual(rows[-1]["pts"], "")
             self.assertEqual(rows[-1]["dts_seconds"], "")
             self.assertEqual(rows[-1]["session_time_s"], "3.0")
-            session.close()
 
     def test_camera_backend_is_importable_without_real_source(self):
         worker = viewer.CameraWorker(5602, "C:/synthetic/test.sdp", queue.Queue())
         self.assertEqual(worker.port, 5602)
         self.assertEqual(worker.source, "C:/synthetic/test.sdp")
         self.assertIsNone(worker.packet_callback)
+
+    def test_camera_uses_bundled_sdp_for_default_rtp_port(self):
+        worker = viewer.CameraWorker(5600, None, queue.Queue())
+        self.assertEqual(worker.source, str(viewer.APP_ROOT / "config_bluerov_5600.sdp"))
 
     def test_camera_session_callback_wiring_both_lifecycles(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,6 +202,7 @@ class SonarViewerOfflineTests(unittest.TestCase):
                 first_app.start_session()
                 self.assertIs(first_worker.packet_callback.__self__, first_app.session)
                 first_app.stop_session()
+                first_app._session_close_thread.join(timeout=5.0)
                 first_app.destroy()
 
                 second_app = viewer.SonarViewer(offline=True)
@@ -208,6 +212,7 @@ class SonarViewerOfflineTests(unittest.TestCase):
                 second_app._attach_camera_session()
                 self.assertIs(second_worker.packet_callback.__self__, second_app.session)
                 second_app.stop_session()
+                second_app._session_close_thread.join(timeout=5.0)
                 second_app.destroy()
             finally:
                 viewer.SESSION_ROOT = previous_root
@@ -222,6 +227,9 @@ class SonarViewerOfflineTests(unittest.TestCase):
             def set_packet_callback(self, callback):
                 order.append(("callback", callback))
                 self.packet_callback = callback
+
+            def set_frame_callback(self, callback):
+                order.append(("frame_callback", callback))
 
         class OrderedSession(object):
             def __init__(self):
@@ -243,8 +251,14 @@ class SonarViewerOfflineTests(unittest.TestCase):
         app.session = OrderedSession()
         app.camera_worker = OrderedWorker()
         app.surveyor_worker = None
+        app.ping_worker = None
+        app.rovl_worker = None
+        app.events = queue.Queue()
+        app.metrics = viewer.MetricsRegistry()
+        app._session_close_thread = None
         app.status_text = Status()
         app.stop_session()
+        app._session_close_thread.join(timeout=5.0)
         self.assertEqual(order[0][0:2], ("callback", None))
         self.assertEqual(order[-1], ("close", False))
         self.assertIsNone(app.camera_worker.packet_callback)
@@ -266,6 +280,7 @@ class SonarViewerOfflineTests(unittest.TestCase):
                 "host_utc_ns": session.session_start_utc_ns + 400_000_000,
                 "key_frame": False, "packet_size": 321,
             })
+            session.close()
             with (session.directory / "camera_timestamps.csv").open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(len(rows), 1)
@@ -274,7 +289,6 @@ class SonarViewerOfflineTests(unittest.TestCase):
             self.assertEqual(rows[0]["pts"], "40")
             self.assertEqual(rows[0]["time_base_den"], "100")
             self.assertEqual(rows[0]["pts_seconds"], "0.4")
-            session.close()
 
     def test_remux_failure_is_explicit_fallback(self):
         if viewer.av is None:
@@ -401,7 +415,7 @@ class SonarViewerOfflineTests(unittest.TestCase):
             self.assertTrue((session.directory / "surveyor_raw.svlog").stat().st_size > 0)
             self.assertEqual(metadata["session_id"], session.session_id)
             self.assertEqual(metadata["closed"], True)
-            self.assertEqual(metadata["camera"]["source"], "udp://0.0.0.0:5600")
+            self.assertEqual(metadata["camera"]["source"], str(viewer.APP_ROOT / "config_bluerov_5600.sdp"))
             ping_line = (session.directory / "surveyor_pings.jsonl").read_text().strip()
             self.assertIn(session.session_id, ping_line)
 
@@ -423,6 +437,17 @@ class SonarViewerOfflineTests(unittest.TestCase):
         self.assertIsNone(app.surveyor_worker)
         self.assertIsNone(app.ping_worker)
         self.assertEqual(str(app.start_surveyor_button.cget("state")), "disabled")
+        app.destroy()
+
+    def test_wet_authorized_gui_shows_ready_visible_start_button(self):
+        try:
+            app = viewer.SonarViewer(offline=True, wet_authorized=True)
+        except Exception as exc:
+            self.skipTest("Tk GUI non disponibile in questo ambiente: %s" % exc)
+        app.update_idletasks()
+        self.assertEqual(str(app.start_surveyor_button.cget("state")), "normal")
+        self.assertTrue(app.start_surveyor_button.winfo_manager())
+        self.assertIn("AUTHORIZED", app.tx_badge["state"].get())
         app.destroy()
 
 

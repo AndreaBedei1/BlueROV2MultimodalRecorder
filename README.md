@@ -1,6 +1,6 @@
 # BlueROV2 Multimodal Recorder
 
-BlueROV2 Multimodal Recorder is a research-oriented acquisition and visualization tool for synchronized underwater sensing using a BlueROV2 equipped with a Cerulean Surveyor 240-16 multibeam sonar, a Blue Robotics Ping1D single-beam sonar, an RGB camera, and an optional Cerulean ROV Locator Mk III topside receiver.
+BlueROV2 Multimodal Recorder is a research-oriented acquisition and visualization tool for synchronized RGB camera, Ping1D and optional Cerulean ROV Locator Mk III data. The Cerulean Surveyor 240-16 is recorded independently onboard by BlueOS / SonarView.
 
 The project records raw and processed sensor data locally, provides a live desktop view, and supports offline Surveyor replay. It is intentionally limited to sensing, visualization, recording, and replay.
 
@@ -16,7 +16,6 @@ The recorder combines three independent real-hardware inputs:
 
 | Stream | Current connection | Preserved output |
 | --- | --- | --- |
-| Cerulean Surveyor 240-16 | TCP `192.168.2.86:62312` | Raw Ping Protocol packets and processed ping records |
 | Blue Robotics Ping1D | UDP `192.168.2.2:9090` through BlueOS PingProxy | Distance, confidence, and full `profile_data` when available |
 | BlueROV2 RGB camera | UDP `5600`, alternatively `5602` | `camera_rgb.mkv` and timestamp metadata |
 | Cerulean ROV Locator Mk III | USB COM, `115200 8N1`, passive read only | Exact NMEA stream, timestamps, decoded positions |
@@ -34,7 +33,6 @@ flowchart LR
 
     subgraph vehicle ["BlueROV2 platform"]
         rgb_camera[RGB camera]
-        surveyor[Surveyor 240-16]
         ping1d[Ping1D]
         rovl[ROV Locator Mk III]
         blueos[BlueOS and MAVLink]
@@ -47,7 +45,7 @@ flowchart LR
     processed_data[(Processed JSONL files)]
 
     rgb_camera --> recorder
-    surveyor --> recorder
+    surveyor[Surveyor] --> sonarview[BlueOS / SonarView] --> svlog[external .svlog]
     ping1d --> recorder
     rovl --> recorder
     blueos -. read-only context .-> recorder
@@ -78,7 +76,7 @@ _Figure 1: Hardware-free dashboard preview; red synthetic-data markers make the 
 
 - Windows with Python 3.8 or newer
 - A reachable BlueROV2 network for live acquisition
-- A local `.svlog` file for offline Surveyor replay
+- BlueOS / SonarView onboard recording for the Surveyor (optional external stream)
 - Tkinter, normally included with the Windows Python distribution
 
 The Python package dependencies are listed in [`requirements.txt`](requirements.txt). PyAV is the preferred camera path; OpenCV is retained as the fallback path.
@@ -119,13 +117,8 @@ The demo updates at approximately `1 Hz`, shows an obvious synthetic marker, and
 scripts\start_recorder.bat
 ```
 
-The normal startup is **DRY / TX LOCKED**. It may connect for passive reading, but it must not enable Surveyor transmission. The GUI keeps the Surveyor start control disabled unless the explicit `--wet-authorized` flag is supplied:
-
-```bat
-scripts\start_recorder.bat --wet-authorized
-```
-
-Use that flag only after the hardware and the in-water safety procedure have been independently approved. It is not used by the launcher default or the offline tests.
+The launcher starts only the desktop Camera/Ping1D/ROVL recorder. It never
+opens the Surveyor socket and has no wet-authorize or auto-start flags.
 
 ### Camera selection
 
@@ -134,7 +127,7 @@ The GUI provides a read-only camera-port selector for UDP `5600` and `5602`, plu
 ### Session workflow
 
 1. Select UDP `5600` or `5602`, or enter an SDP/URL.
-2. Press **Connect all** for the configured live inputs, or use `--offline` / `--replay-surveyor`.
+2. Press **Connect all** for the configured live inputs, or use `--offline` / `--demo`.
 3. Press **START SESSION**.
 4. Press **STOP SESSION** before closing the GUI.
 5. Press **Disconnect** when the live connection is no longer needed.
@@ -151,12 +144,10 @@ records/real_sessions/<session_id>/
 ├── events.jsonl
 ├── camera_rgb.mkv
 ├── camera_timestamps.csv
-├── surveyor_raw.svlog
-├── surveyor_pings.jsonl
 └── ping1d.jsonl
 ```
 
-`surveyor_raw.svlog` stores the original received Surveyor packet stream. `surveyor_pings.jsonl` is the processed convenience representation and may contain ATOF detections, channel-data status, range, speed of sound, ping rate, ping number, device timestamp, and optional attitude. The GUI beamforms validated channel data in memory; the source channel packets remain in the raw file. `ping1d.jsonl` retains both the distance record and the full normalized profile record when the device returns one.
+Surveyor `.svlog` files are produced externally by BlueOS/SonarView. `ping1d.jsonl` retains both the distance record and the full normalized profile record when the device returns one.
 
 Camera PTS/DTS and time-base values are stored only when supplied by PyAV. Host `monotonic_ns` and `utc_ns` values are recorded separately so samples can be matched without treating container PTS as a wall clock.
 
@@ -166,19 +157,20 @@ The complete field-level contract is in [`docs/DATA_FORMAT.md`](docs/DATA_FORMAT
 
 The passive serial protocol, coordinate-frame rules, and hardware-test checklist are documented in [`docs/ROV_LOCATOR.md`](docs/ROV_LOCATOR.md).
 
-## 🔄 Offline replay
+## 🔄 Offline Surveyor analysis
 
-Replay does not connect to the Surveyor and does not send acoustic commands:
+The live recorder has no Surveyor replay flag. Analyze an existing `.svlog`
+with the standalone log viewer:
 
 ```bat
-scripts\start_recorder.bat --offline --replay-surveyor records\example.svlog
+scripts\start_log_viewer.bat --summary --file records\example.svlog
 ```
 
 Equivalent module invocation:
 
 ```powershell
 $env:PYTHONPATH = "$PWD\src"
-python -m bluerov_recorder.app --offline --replay-surveyor records\example.svlog
+python -m bluerov_recorder.log_viewer --summary --file records\example.svlog
 ```
 
 The standalone read-only log explorer can index and summarize `.svlog` files:
@@ -193,7 +185,7 @@ Replay a complete recorder session with its optional ROVL trajectory and nearest
 scripts\start_log_viewer.bat --session records\real_sessions\<session_id>
 ```
 
-`--skip-surveyor` omits the live Surveyor worker. If replay and `--skip-surveyor` are both supplied, replay takes precedence so the requested `.svlog` can still be visualized.
+Legacy sessions containing Surveyor files remain readable by offline tools.
 
 ## 🧪 Testing
 
@@ -211,7 +203,7 @@ Tests that require an optional PyAV codec path skip themselves when PyAV or an e
 
 - Verify the PC is on the vehicle Ethernet network.
 - Check BlueOS at `192.168.2.2`.
-- Confirm the Surveyor address `192.168.2.86:62312`.
+- Confirm that Surveyor recording is active in BlueOS/SonarView (the desktop app does not connect to it).
 - Confirm PingProxy at `192.168.2.2:9090`.
 - Check that the selected camera port matches the BlueOS stream output.
 
@@ -219,13 +211,10 @@ Tests that require an optional PyAV codec path skip themselves when PyAV or an e
 
 Try the alternate UDP port, enter the SDP path/URL, and check the reported backend. PyAV is preferred for encoded-packet remux; OpenCV is only a fallback and cannot preserve encoded PTS/DTS in the same way.
 
-### The Surveyor start button is locked
+### Surveyor data is unavailable in the desktop dashboard
 
-This is the expected default safety state. A live start requires explicit `--wet-authorized`; replay and offline paths never need it.
-
-### A fan image is unavailable during replay
-
-The `.svlog` must contain a complete set of eight message-`3009` channel-pair packets for a ping. ATOF-only logs still provide detections and polar views, but do not contain enough channel data for the reconstructed fan image.
+This is intentional. Use BlueOS/SonarView for onboard Surveyor capture and the
+offline log viewer for later analysis.
 
 ## 📁 Repository layout
 

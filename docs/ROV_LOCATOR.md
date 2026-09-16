@@ -61,7 +61,10 @@ If true angles are unavailable but apparent Math bearing/elevation exist, the ap
 
 ## 🔄 Demo and replay
 
-Run `scripts\start_recorder.bat --demo-rovl` for an obvious synthetic track at approximately `1 Hz`. The range remains near `8–12 m`, bearing changes along a curved path, and elevation is negative. Red labels identify synthetic data, and recording is disabled by default.
+Run `scripts\start_recorder.bat --demo` for a hardware-free synthetic camera,
+Ping1D and ROVL dashboard. The ROVL track is approximately `1 Hz`; recording
+is enabled only when the operator presses START SESSION. `--demo-rovl` remains
+accepted as a compatibility alias.
 
 Run `scripts\start_log_viewer.bat --session <directory>` to inspect a recorded trajectory. The viewer selects the ROVL sample nearest to the chosen host-monotonic timeline time. Sessions without ROVL remain readable and display an explicit absence message.
 

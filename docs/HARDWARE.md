@@ -6,7 +6,11 @@ _Hardware boundary for the BlueROV2 Multimodal Recorder._
 
 ## 📋 System summary
 
-The recorder is designed around a real BlueROV2 platform with three sensing inputs: a Cerulean Surveyor 240-16, a Blue Robotics Ping1D, and an RGB camera stream. The addresses below are the configuration used by this project, not universal defaults for every vehicle.
+The desktop recorder uses three live inputs: a Blue Robotics Ping1D, an RGB
+camera stream, and an optional read-only Cerulean ROV Locator Mk III. The
+Surveyor 240-16 is intentionally external to this process and is recorded by
+BlueOS / Cerulean SonarView onboard. The addresses below are project
+configuration, not universal defaults.
 
 ## 🚢 BlueROV2
 
@@ -24,11 +28,15 @@ The recorder may observe the following platform elements without controlling the
 
 The exact BlueROV2 revision, payload mounting, camera model, and vehicle telemetry availability are configuration-specific and are not inferred by this repository.
 
-## 📡 Cerulean Surveyor 240-16
+## 📡 Cerulean Surveyor 240-16 (external recording)
 
 The Surveyor 240-16 is the multibeam echosounder used by this project. Cerulean describes it as a 240 kHz multibeam echo sounder, and the Python interface exposes the `Surveyor240` device class.[^2][^3]
 
-The application handles these Surveyor concepts:
+The desktop application does not connect to or control the Surveyor. BlueOS /
+SonarView owns the device and writes `.svlog` files on the rover. The offline
+parser in this repository can inspect those files later.
+
+Legacy offline concepts:
 
 | Concept | Meaning in this project |
 | --- | --- |
@@ -42,13 +50,14 @@ The application handles these Surveyor concepts:
 
 Both the raw packet stream and the processed records are retained. Raw packets preserve future decoding options and provenance; JSONL records make common inspection and synchronization tasks convenient without pretending to replace the source bytes.
 
-Project configuration:
+External vehicle endpoint (not opened by this app):
 
 ```text
 TCP 192.168.2.86:62312
 ```
 
-The default recorder state is `DRY / TX LOCKED`. Normal startup does not call the Surveyor ping-parameter command with `ping_enable=True`. The only application path that can request acoustic start is guarded by `--wet-authorized`; replay never creates a Surveyor device.
+No Surveyor TX flag, start button, replay option or socket is part of the live
+recorder CLI.
 
 ## 📏 Blue Robotics Ping1D
 

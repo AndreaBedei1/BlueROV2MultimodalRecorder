@@ -13,6 +13,11 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from .runtime import LatestValueMailbox, MetricsRegistry, publish_control_event
+except ImportError:  # Support direct module execution in import-isolation tests.
+    from bluerov_recorder.runtime import LatestValueMailbox, MetricsRegistry, publish_control_event
+
 try:  # Keep the rest of the recorder importable without hardware extras.
     import serial
     from serial.tools import list_ports
@@ -354,8 +359,9 @@ def discover_rovl_port(
 
 
 class _LimitedEvents:
-    def __init__(self, events: queue.Queue):
+    def __init__(self, events: queue.Queue, metrics: Optional[MetricsRegistry] = None):
         self.events = events
+        self.metrics = metrics
         self.counts: Dict[str, int] = {}
 
     def emit(self, kind: str, data: object, every: int = 50) -> None:
@@ -364,7 +370,7 @@ class _LimitedEvents:
         if count == 1 or count % every == 0:
             payload = dict(data) if isinstance(data, dict) else {"detail": data}
             payload["occurrence_count"] = count
-            self.events.put((kind, payload))
+            publish_control_event(self.events, (kind, payload), self.metrics)
 
 
 class ROVLWorker(threading.Thread):
@@ -377,18 +383,30 @@ class ROVLWorker(threading.Thread):
         serial_factory=None,
         devices: Optional[Iterable[object]] = None,
         probe_seconds: float = 0.45,
+        preview_mailbox: Optional[LatestValueMailbox] = None,
+        metrics: Optional[MetricsRegistry] = None,
+        record_callback=None,
     ):
-        super().__init__(daemon=True, name="rovl-read-only")
+        super().__init__(daemon=False, name="rovl-read-only")
         self.requested_port = None if not port or str(port).lower() == "auto" else str(port)
         self.events = events
         self.serial_factory = serial_factory
         self.devices = devices
         self.probe_seconds = float(probe_seconds)
+        self.preview_mailbox = preview_mailbox
+        self.metrics = metrics or MetricsRegistry()
+        self.record_callback = record_callback
         self.stop_event = threading.Event()
         self.handle = None
         self.port: Optional[str] = None
         self._source_offset = 0
         self._last_lock = False
+
+    def _event(self, kind: str, data=None, critical: bool = False) -> bool:
+        return publish_control_event(self.events, (kind, data), self.metrics, critical)
+
+    def set_record_callback(self, callback) -> None:
+        self.record_callback = callback
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -413,23 +431,24 @@ class ROVLWorker(threading.Thread):
             "parsed": parsed,
             "position": position,
             "synthetic": False,
+            "port": self.port,
         }
         self._source_offset += len(frame)
         return sample
 
     def run(self) -> None:
-        limited = _LimitedEvents(self.events)
+        limited = _LimitedEvents(self.events, self.metrics)
         try:
             self.port = self.requested_port or discover_rovl_port(
                 self.devices, self.serial_factory, self.probe_seconds,
             )
             if not self.port:
-                self.events.put(("rovl_unavailable", {"reason": "no passive ROVL stream detected"}))
+                self._event("rovl_unavailable", {"reason": "no passive ROVL stream detected"})
                 return
             self.handle = _open_serial(self.port, 0.2, self.serial_factory)
-            self.events.put(("rovl_connected", {
+            self._event("rovl_connected", {
                 "port": self.port, "baud": ROVL_BAUD, "mode": "read-only", "synthetic": False,
-            }))
+            })
             framer = NMEALineFramer()
             while not self.stop_event.is_set():
                 chunk = self.handle.read(4096) or b""
@@ -438,7 +457,14 @@ class ROVLWorker(threading.Thread):
                 for frame in framer.feed(chunk):
                     sample = self._sample(frame)
                     parsed = sample["parsed"]
-                    self.events.put(("rovl_sample", sample))
+                    self.metrics.increment("rovl_samples_received")
+                    if self.record_callback is not None:
+                        self.record_callback(sample)
+                        self.metrics.increment("rovl_samples_recorded")
+                    if self.preview_mailbox is not None:
+                        self.preview_mailbox.publish(sample)
+                    else:
+                        self._event("rovl_sample", sample)
                     if parsed["checksum_present"] and parsed["checksum_ok"] is False:
                         limited.emit("rovl_checksum_error", {"raw_sentence": parsed["raw_sentence"]})
                     elif not parsed["parse_ok"]:
@@ -446,13 +472,13 @@ class ROVLWorker(threading.Thread):
                     position = sample.get("position")
                     locked = bool(position and position.get("lock"))
                     if locked != self._last_lock:
-                        self.events.put(("rovl_lock_acquired" if locked else "rovl_lock_lost", {
+                        self._event("rovl_lock_acquired" if locked else "rovl_lock_lost", {
                             "port": self.port, "method": position.get("method") if position else None,
-                        }))
+                        })
                         self._last_lock = locked
         except Exception as exc:
             if not self.stop_event.is_set():
-                self.events.put(("rovl_serial_error", {"port": self.port, "error": str(exc)}))
+                self._event("rovl_serial_error", {"port": self.port, "error": str(exc)}, critical=True)
         finally:
             if self.handle is not None:
                 try:
@@ -460,7 +486,7 @@ class ROVLWorker(threading.Thread):
                 except Exception:
                     pass
             self.handle = None
-            self.events.put(("rovl_disconnected", {"port": self.port, "synthetic": False}))
+            self._event("rovl_disconnected", {"port": self.port, "synthetic": False})
 
 
 class DemoROVLWorker(threading.Thread):

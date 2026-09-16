@@ -1,11 +1,9 @@
-"""Public Surveyor-facing API.
+"""Public offline Surveyor parsing/replay API.
 
-The implementation remains in :mod:`bluerov_recorder.app` for compatibility
-with the extracted application.  These exports give callers a focused module
-without creating a second device-control implementation.
+These helpers are intentionally separated from the live recorder entry point.
 """
 
-from .app import (
+from .offline_app import (
     SurveyorWorker,
     build_surveyor_record,
     decode_packet_stream_chunk,
@@ -18,4 +16,3 @@ __all__ = [
     "decode_packet_stream_chunk",
     "replay_surveyor",
 ]
-

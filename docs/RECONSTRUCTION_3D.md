@@ -1,5 +1,9 @@
 # Future 3D reconstruction
 
+Surveyor acquisition is external to the desktop recorder. BlueOS/SonarView
+records the onboard `.svlog`; offline tools in this repository can consume it
+alongside Camera/Ping1D/ROVL sessions for later fusion.
+
 _Design boundary for a future global seabed reconstruction pipeline._
 
 ---

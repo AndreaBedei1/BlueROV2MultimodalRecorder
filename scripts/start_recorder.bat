@@ -17,6 +17,7 @@ if defined VIRTUAL_ENV (
     )
 )
 
+rem Safe default: starts the desktop Camera/Ping1D/ROVL recorder only.
 %BLUEROV_RECORDER_PYTHON% -m bluerov_recorder.app %*
 set "BLUEROV_RECORDER_EXIT=%ERRORLEVEL%"
 endlocal & exit /b %BLUEROV_RECORDER_EXIT%

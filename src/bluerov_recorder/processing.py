@@ -11,8 +11,15 @@ from __future__ import annotations
 import math
 import mmap
 import struct
+from functools import lru_cache
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+
+try:
+    import numpy as np
+except ImportError:  # The reference path keeps log inspection usable.
+    np = None
 
 
 PACKET_HEADER = struct.Struct("<BBHHBB")
@@ -36,6 +43,106 @@ ATOF_HEADER = struct.Struct("<IQffIIfIHH")
 ATTITUDE = struct.Struct("<ffffffQI")
 
 
+@dataclass
+class PacketFramingDiagnostics:
+    bytes_received: int = 0
+    packets_framed: int = 0
+    checksum_valid: int = 0
+    checksum_invalid: int = 0
+    framing_resync_count: int = 0
+    framing_discarded_bytes: int = 0
+    unknown_message_count: int = 0
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "bytes_received": self.bytes_received,
+            "packets_framed": self.packets_framed,
+            "checksum_valid": self.checksum_valid,
+            "checksum_invalid": self.checksum_invalid,
+            "framing_resync_count": self.framing_resync_count,
+            "framing_discarded_bytes": self.framing_discarded_bytes,
+            "unknown_message_count": self.unknown_message_count,
+        }
+
+
+class PingProtocolFramer:
+    """Incremental Ping Protocol framer with explicit corruption accounting.
+
+    Raw socket chunks must be persisted before calling :meth:`feed`; this
+    parser may discard malformed bytes only from its private decode buffer.
+    """
+
+    KNOWN_MESSAGES = {MSG_JSON, MSG_ATTITUDE, MSG_RAW_PROFILE, MSG_END_PING, MSG_ATOF, 14}
+
+    def __init__(self, validate_checksum: bool = True, accept_invalid: bool = False) -> None:
+        self.buffer = bytearray()
+        self.validate_checksum = bool(validate_checksum)
+        self.accept_invalid = bool(accept_invalid)
+        self.diagnostics = PacketFramingDiagnostics()
+
+    @staticmethod
+    def checksum_ok(packet: bytes) -> bool:
+        if len(packet) < PACKET_HEADER.size + PACKET_CHECKSUM.size:
+            return False
+        expected = PACKET_CHECKSUM.unpack_from(packet, len(packet) - PACKET_CHECKSUM.size)[0]
+        return (sum(packet[:-PACKET_CHECKSUM.size]) & 0xFFFF) == expected
+
+    def feed(self, chunk: bytes) -> List[Tuple[int, bytes, bytes]]:
+        payload_chunk = bytes(chunk)
+        self.diagnostics.bytes_received += len(payload_chunk)
+        self.buffer.extend(payload_chunk)
+        packets: List[Tuple[int, bytes, bytes]] = []
+        while True:
+            start = self.buffer.find(b"BR")
+            if start < 0:
+                if len(self.buffer) > 1:
+                    discarded = len(self.buffer) - 1
+                    del self.buffer[:-1]
+                    self.diagnostics.framing_resync_count += 1
+                    self.diagnostics.framing_discarded_bytes += discarded
+                break
+            if start:
+                del self.buffer[:start]
+                self.diagnostics.framing_resync_count += 1
+                self.diagnostics.framing_discarded_bytes += start
+            if len(self.buffer) < PACKET_HEADER.size:
+                break
+            try:
+                sync_a, sync_b, payload_len, message_id, _src, _dst = PACKET_HEADER.unpack_from(self.buffer)
+            except struct.error:
+                break
+            if sync_a != 66 or sync_b != 82:
+                del self.buffer[0]
+                self.diagnostics.framing_resync_count += 1
+                self.diagnostics.framing_discarded_bytes += 1
+                continue
+            total = PACKET_HEADER.size + int(payload_len) + PACKET_CHECKSUM.size
+            if len(self.buffer) < total:
+                break
+            packet = bytes(self.buffer[:total])
+            valid = self.checksum_ok(packet)
+            if valid:
+                self.diagnostics.checksum_valid += 1
+            else:
+                self.diagnostics.checksum_invalid += 1
+            if self.validate_checksum and not valid and not self.accept_invalid:
+                # Shift one byte rather than trusting a corrupt length.  The
+                # next iteration safely searches for the following sync word.
+                del self.buffer[0]
+                self.diagnostics.framing_resync_count += 1
+                self.diagnostics.framing_discarded_bytes += 1
+                continue
+            del self.buffer[:total]
+            payload_start = PACKET_HEADER.size
+            payload = packet[payload_start : payload_start + int(payload_len)]
+            message_id = int(message_id)
+            self.diagnostics.packets_framed += 1
+            if message_id not in self.KNOWN_MESSAGES:
+                self.diagnostics.unknown_message_count += 1
+            packets.append((message_id, payload, packet))
+        return packets
+
+
 def make_packet(packet_id: int, payload: bytes) -> bytes:
     """Build one checksum-bearing Ping Protocol packet."""
     header = PACKET_HEADER.pack(66, 82, len(payload), int(packet_id), 0, 0)
@@ -43,7 +150,11 @@ def make_packet(packet_id: int, payload: bytes) -> bytes:
     return body + PACKET_CHECKSUM.pack(sum(body) & 0xFFFF)
 
 
-def iter_svlog_packets(path: Path) -> Iterator[Tuple[int, bytes, bytes]]:
+def iter_svlog_packets(
+    path: Path,
+    diagnostics: Optional[PacketFramingDiagnostics] = None,
+    validate_checksum: bool = False,
+) -> Iterator[Tuple[int, bytes, bytes]]:
     """Yield ``(message_id, payload, complete_packet)`` from a ``.svlog``.
 
     The parser is intentionally conservative: it follows the Ping Protocol
@@ -52,31 +163,23 @@ def iter_svlog_packets(path: Path) -> Iterator[Tuple[int, bytes, bytes]]:
     schema for them.
     """
     path = Path(path)
-    with path.open("rb") as stream:
-        if stream.seek(0, 2) == 0:
-            return
-        stream.seek(0)
-        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            pos = 0
-            size = len(data)
-            while pos + PACKET_HEADER.size + PACKET_CHECKSUM.size <= size:
-                start = data.find(b"BR", pos)
-                if start < 0 or start + PACKET_HEADER.size + PACKET_CHECKSUM.size > size:
-                    return
-                try:
-                    sync_a, sync_b, payload_len, message_id, _src, _dst = PACKET_HEADER.unpack_from(data, start)
-                except struct.error:
-                    return
-                if sync_a != 66 or sync_b != 82:
-                    pos = start + 2
-                    continue
-                end = start + PACKET_HEADER.size + payload_len + PACKET_CHECKSUM.size
-                if end > size:
-                    return
-                packet = bytes(data[start:end])
-                payload_start = start + PACKET_HEADER.size
-                yield int(message_id), bytes(data[payload_start : payload_start + payload_len]), packet
-                pos = end
+    framer = PingProtocolFramer(validate_checksum=validate_checksum, accept_invalid=not validate_checksum)
+    with Path(path).open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            for packet in framer.feed(chunk):
+                yield packet
+    if diagnostics is not None:
+        state = framer.diagnostics
+        diagnostics.bytes_received = state.bytes_received
+        diagnostics.packets_framed = state.packets_framed
+        diagnostics.checksum_valid = state.checksum_valid
+        diagnostics.checksum_invalid = state.checksum_invalid
+        diagnostics.framing_resync_count = state.framing_resync_count
+        diagnostics.framing_discarded_bytes = state.framing_discarded_bytes
+        diagnostics.unknown_message_count = state.unknown_message_count
 
 
 def parse_channel_data_header(payload: bytes) -> Optional[Dict[str, Union[int, float]]]:
@@ -210,7 +313,7 @@ def _range_compensation(start_m: float, end_m: float, bins: int) -> List[float]:
     ]
 
 
-def beamform_surveyor_channels(
+def beamform_surveyor_channels_reference(
     channel_signals: Dict[int, Sequence[float]],
     start_m: float,
     end_m: float,
@@ -219,12 +322,7 @@ def beamform_surveyor_channels(
     angle_min_deg: float = SURVEYOR_FOV_DEG[0],
     angle_max_deg: float = SURVEYOR_FOV_DEG[1],
 ) -> List[List[float]]:
-    """Beamform validated 16-channel IQ into an angle-by-range fan.
-
-    ``threshold_percent=0`` is intentionally the default: it preserves the
-    background.  A positive value removes only range columns whose mean
-    channel power is below that percentile, as a display option.
-    """
+    """Original scalar implementation retained as a regression oracle."""
     if set(channel_signals) != set(range(SURVEYOR_CHANNEL_COUNT)):
         raise ValueError("16 Surveyor channels required")
     lengths = {len(channel_signals[index]) for index in range(SURVEYOR_CHANNEL_COUNT)}
@@ -283,6 +381,74 @@ def beamform_surveyor_channels(
                 imag_sum += imag * cos_phase + real * sin_phase
             matrix[beam_index][range_index] = real_sum * real_sum + imag_sum * imag_sum
     return matrix
+
+
+@lru_cache(maxsize=32)
+def _steering_matrix(sos_mps: float, angle_min_deg: int, angle_max_deg: int):
+    if np is None:
+        return None
+    positions = (
+        np.arange(SURVEYOR_CHANNEL_COUNT, dtype=np.float32)
+        - np.float32(0.5 * (SURVEYOR_CHANNEL_COUNT - 1))
+    ) * np.float32(CHANNEL_SPACING_M)
+    angles = np.deg2rad(
+        np.arange(int(angle_min_deg), int(angle_max_deg) + 1, dtype=np.float32)
+    )
+    wavelength = np.float32(float(sos_mps) / SURVEYOR_ACOUSTIC_HZ)
+    phases = np.sin(angles)[:, None] / wavelength * np.float32(2.0 * math.pi) * positions[None, :]
+    return np.exp(1j * phases).astype(np.complex64)
+
+
+def beamform_surveyor_channels(
+    channel_signals: Dict[int, Sequence[float]],
+    start_m: float,
+    end_m: float,
+    sos_mps: float = 1500.0,
+    threshold_percent: float = 0.0,
+    angle_min_deg: float = SURVEYOR_FOV_DEG[0],
+    angle_max_deg: float = SURVEYOR_FOV_DEG[1],
+) -> List[List[float]]:
+    """Vectorized 16-channel IQ beamformer preserving the scalar convention.
+
+    ``threshold_percent=0`` is intentionally the default: it preserves the
+    background.  A positive value removes only range columns whose mean
+    channel power is below that percentile, as a display option.
+    """
+    if np is None:
+        return beamform_surveyor_channels_reference(
+            channel_signals, start_m, end_m, sos_mps, threshold_percent,
+            angle_min_deg, angle_max_deg,
+        )
+    if set(channel_signals) != set(range(SURVEYOR_CHANNEL_COUNT)):
+        raise ValueError("16 Surveyor channels required")
+    lengths = {len(channel_signals[index]) for index in range(SURVEYOR_CHANNEL_COUNT)}
+    if len(lengths) != 1 or not lengths or next(iter(lengths)) < 2 or next(iter(lengths)) % 2:
+        raise ValueError("channel IQ arrays must have an equal even length")
+    bins = next(iter(lengths)) // 2
+    packed = np.asarray(
+        [channel_signals[index] for index in range(SURVEYOR_CHANNEL_COUNT)],
+        dtype=np.float32,
+    ).reshape(SURVEYOR_CHANNEL_COUNT, bins, 2)
+    iq = packed[:, :, 0].astype(np.complex64)
+    iq += np.complex64(1j) * packed[:, :, 1]
+    compensation = np.asarray(_range_compensation(start_m, end_m, bins), dtype=np.float32)
+    iq *= compensation[None, :]
+    range_power = np.sum(np.abs(iq) ** 2, axis=0)
+    threshold_percent = max(0.0, min(100.0, float(threshold_percent)))
+    keep = None
+    if threshold_percent > 0.0:
+        ordered = np.sort(range_power)
+        index = int(round((len(ordered) - 1) * threshold_percent / 100.0))
+        keep = range_power >= ordered[index]
+
+    steering = _steering_matrix(
+        round(float(sos_mps or 1500.0), 6), int(angle_min_deg), int(angle_max_deg)
+    )
+    beam_complex = steering @ iq
+    power = (beam_complex.real * beam_complex.real + beam_complex.imag * beam_complex.imag).astype(np.float32)
+    if keep is not None:
+        power[:, ~keep] = 0.0
+    return power.tolist()
 
 
 def decode_atof_payload(payload: bytes) -> Optional[Dict[str, object]]:
